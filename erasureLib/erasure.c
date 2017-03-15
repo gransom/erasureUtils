@@ -1,5 +1,3 @@
-#include <erasure.h>
-
 #include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
@@ -14,6 +12,8 @@
 #endif
 #include <assert.h>
 #include <pthread.h>
+
+#include <erasure.h>
 
 #ifndef __MARFS_COPYRIGHT_H__
 #define __MARFS_COPYRIGHT_H__
@@ -181,6 +181,17 @@ void bq_close(BufferQueue *bq) {
 void bq_abort(BufferQueue *bq) {
   bq_signal(bq, BQ_ABORT);
 }
+
+#ifdef NULL_IO
+// these are all fillers that will replace IO calls with no-ops that
+// return success.
+#define open(PATH, MODE, ...) (4)
+#define close(FD)   (0)
+#define write(FILE, BUFFER, SIZE) (SIZE)
+#define fsync(FILE) (0)
+#define rename(...) (0)
+#define chown(...)  (0)
+#endif
 
 static int set_block_xattr(ne_handle handle, int block) {
   int tmp = 0;
