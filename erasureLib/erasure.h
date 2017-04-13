@@ -200,6 +200,7 @@ typedef struct handle {
 } *ne_handle;
 
 /* Erasure Utility Functions */
+int ne_is_open(const char *path, size_t num_blocks);
 ne_handle ne_open( char *path, ne_mode mode, ... );
 int ne_read( ne_handle handle, void *buffer, int nbytes, off_t offset );
 int ne_write( ne_handle handle, void *buffer, size_t nbytes );

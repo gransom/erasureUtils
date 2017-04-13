@@ -200,9 +200,7 @@ static int set_block_xattr(ne_handle handle, int block) {
   if ( handle->mode == NE_REBUILD ) {
     strncat( meta_file, REBUILD_SFX, strlen(REBUILD_SFX)+1 );
   }
-  else if ( handle->mode == NE_WRONLY ) {
-    strncat( meta_file, WRITE_SFX, strlen(WRITE_SFX)+1 );
-  }
+
   strncat( meta_file, META_SFX, strlen(META_SFX) + 1 );
   mode_t mask = umask(0000);
   int fd = open( meta_file, O_WRONLY | O_CREAT, 0666 );
@@ -223,17 +221,20 @@ static int set_block_xattr(ne_handle handle, int block) {
       tmp = close( fd );
     }
   }
-  chown(meta_file, handle->owner, handle->group);
+  // only chown if we are rebuilding
+  if(handle->mode == NE_REBUILD) {
+    chown(meta_file, handle->owner, handle->group);
+  }
 #else
 
-#warn "xattr metadata is not functional with new thread model"
-#if (AXATTR_SET_FUNC == 5) // XXX: not functional with threads!!!
+#  warn "xattr metadata is not functional with new thread model"
+#  if (AXATTR_SET_FUNC == 5) // XXX: not functional with threads!!!
   tmp = fsetxattr(handle->FDArray[counter], XATTRKEY, xattrval,
                   strlen(xattrval), 0);
-#else
+#  else
   tmp = fsetxattr(handle->FDArray[counter], XATTRKEY, xattrval,
                   strlen(xattrval), 0, 0);
-#endif
+#  endif
 
 #endif //META_FILES
   return tmp;
@@ -338,21 +339,7 @@ void *bq_writer(void *arg) {
     // if we failed to set the xattr, don't bother with the rename.
     return NULL;
   }
-  char block_file_path[2048];
-  sprintf( block_file_path, handle->path,
-           (bq->block_number+handle->erasure_offset)%(handle->N+handle->E) );
-  if( rename( bq->path, block_file_path ) != 0 ) {
-    DBG_FPRINTF( stderr, "ne_close: failed to rename written file %s\n", bq->path );
-    bq->flags |= BQ_ERROR;
-  }
-#ifdef META_FILES
-  strncat( bq->path, META_SFX, strlen(META_SFX)+1 );
-  strncat( block_file_path, META_SFX, strlen(META_SFX)+1 );
-  if ( rename( bq->path, block_file_path ) != 0 ) {
-    DBG_FPRINTF( stderr, "ne_close: failed to rename written meta file %s\n", bq->path );
-    bq->flags |= BQ_ERROR;
-  }
-#endif
+
   return NULL;
 }
 
@@ -385,7 +372,6 @@ static int initialize_queues(ne_handle handle) {
     BufferQueue *bq = &handle->blocks[i];
     // generate the path
     sprintf(bq->path, handle->path, (i + handle->erasure_offset) % num_blocks);
-    strcat(bq->path, WRITE_SFX);
 
     // assign pointers into the memaligned buffers.
     void *buffers[MAX_QDEPTH];
@@ -475,6 +461,45 @@ int bq_enqueue(BufferQueue *bq, void *buf, size_t size) {
   pthread_mutex_unlock(&bq->qlock);
 
   return ret;
+}
+
+/**
+ * Test whether an object is still open.
+ *
+ * This may return that the object is still open when in fact it is
+ * just corrupt and missing some of its blocks. The number that is
+ * returned should be checked against E and if it is less than or
+ * equal to E the object is probably not open for writing by some
+ * other process.
+ */
+int ne_is_open(const char *path_template, size_t num_blocks)
+{
+   int block;
+   unsigned int missing_meta = 0;
+   for(block = 0; block < num_blocks; block++) {
+      char block_path[MAXNAME];
+      snprintf(block_path, MAXNAME, path_template, block);
+#ifdef META_FILES
+      strncat(block_path, META_SFX, MAXNAME);
+      struct stat statbuf;
+      if(stat(block_path, &statbuf) == -1) {
+         missing_meta++;
+      }
+#else
+      int result;
+      char xattrval[1024];
+# if (AXATTR_GET_FUNC == 4)
+      result = getxattr(block_path, XATTRKEY, xattrval, sizeof(xattrval));
+# else
+      result = getxattr(block_path, XATTRKEY, xattrval, sizeof(xattrval), 0, 0);
+# endif
+      if(result == -1) {
+         missing_meta++;
+      }
+#endif // META_FILES
+   }
+
+   return missing_meta;
 }
 
 /**
@@ -683,11 +708,7 @@ ne_handle ne_open( char *path, ne_mode mode, ... )
        handle->buffs[counter] = handle->buffer + ( counter*bsz ); //make space for block
 #endif
        
-       if( mode == NE_WRONLY ) {
-         DBG_FPRINTF( stdout, "   opening %s%s for write\n", file, WRITE_SFX );
-         handle->FDArray[counter] = open( strncat( file, WRITE_SFX, strlen(WRITE_SFX)+1 ), O_WRONLY | O_CREAT, 0666 );
-       }
-       else if ( mode == NE_REBUILD  &&  handle->src_in_err[counter] == 1 ) {
+       if ( mode == NE_REBUILD  &&  handle->src_in_err[counter] == 1 ) {
          DBG_FPRINTF( stdout, "   opening %s%s for write\n", file, REBUILD_SFX );
          handle->FDArray[counter] = open( strncat( file, REBUILD_SFX, strlen(REBUILD_SFX)+1 ), O_WRONLY | O_CREAT, 0666 );
          
@@ -1278,36 +1299,7 @@ read:
 }
 
 void sync_file(ne_handle handle, int block_index) {
-#if 0
-  char path[1024];
-  int block_number = (handle->erasure_offset + block_index)
-    % (handle->N + handle->E);
-  sprintf(path, handle->path, block_number);
-  strcat(path, WRITE_SFX);
-  close(handle->FDArray[block_index]);
-  handle->FDArray[block_index] = open(path, O_WRONLY);
-  if(handle->FDArray[block_index] == -1) {
-    DBG_FPRINTF(stderr, "failed to reopen file\n");
-    handle->src_in_err[block_index] = 1;
-    handle->src_err_list[handle->nerr] = block_index;
-    handle->nerr++;
-    return;
-  }
-
-  off_t seek = lseek(handle->FDArray[block_index],
-                     handle->written[block_index],
-                     SEEK_SET);
-  if(seek < handle->written[block_index]) {
-    DBG_FPRINTF(stderr, "failed to seek reopened file\n");
-    handle->src_in_err[block_index] = 1;
-    handle->src_err_list[handle->nerr] = block_index;
-    handle->nerr++;
-    close(handle->FDArray[block_index]);
-    return;
-  }
-#else
   fsync(handle->FDArray[block_index]);
-#endif
 }
 
 
