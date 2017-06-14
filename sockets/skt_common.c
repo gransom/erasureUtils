@@ -143,33 +143,19 @@ void jskt_close(void* handle) {
 // EOF.  Return negative for error.  Otherwise, return the total
 // number of bytes that could be read.  If return-value is positive,
 // but less than <size>, there must've been an EOF.
+//
+// NOTE: The separation of read_buffer_from_file() and
+//     read_buffer_from_socket() became necessary when we added
+//     unread_pseudo_packet_header() to support early seek-detection in
+//     copy_file_to_socket().  This early-detection means that
+//     read_pseudo_packet_header() must take a handle, instead of an fd, so
+//     that any previously-unread header can be read.  And the threading of
+//     that handle propagates to these functions.  Unfortunately, callers
+//     of read_buffer_file_from() do not have a handle.  A little ugly.
 
-ssize_t read_buffer(int fd, char* buf, size_t size, int is_socket) {
+static
+ssize_t read_buffer_internal(int fd, char* buf, size_t size, int is_socket) {
   neDBG("read_buffer(%d, 0x%llx, %lld, %d)\n", fd, buf, size, is_socket);
-
-
-#ifdef USE_RIOWRITE
-  // If we would be reading from an rsocket where the writer is using
-  // riowrite(), then we won't see anything in the fd; RDMA is
-  // transparently moving data directly into our buffer.  In that
-  // case, the writer will send us a DATA pseudo-packet, to indicate
-  // when the RDMA is complete.  (And we already told the writer how
-  // big our buffer is, so the DATA packet won't indicate a size
-  // bigger than that.)  If we get an actual EOF on the socket, that's
-  // an error; the server should send DATA 0, to indicate an EOF on
-  // file-data.
-
-  if (is_socket) {
-    PseudoPacketHeader header;
-    NEED_0( read_pseudo_packet_header(fd, &header) );
-    if (header.command != CMD_DATA) {
-      neERR("unexpected pseudo-packet: %s\n", command_str(header.command));
-      return -1;
-    }
-
-    return header.size;
-  }
-#endif
 
   char*   read_ptr    = buf;
   size_t  read_total  = 0;
@@ -208,26 +194,55 @@ ssize_t read_buffer(int fd, char* buf, size_t size, int is_socket) {
 }
 
 
+ssize_t read_buffer_from_file(int fd, char* buf, size_t size) {
+  neDBG("read_buffer_from_file(%d, 0x%llx, %lld, %d)\n", fd, buf, size);
+  return read_buffer_internal(fd, buf, size, 0);
+}
+
+
+ssize_t read_buffer_from_socket(SocketHandle* handle, char* buf, size_t size) {
+  neDBG("read_buffer_from_socket(%d, 0x%llx, %lld, %d)\n", handle, buf, size);
+
+#ifdef USE_RIOWRITE
+  // If we would be reading from an rsocket where the writer is using
+  // riowrite(), then we won't see anything in the fd; RDMA is
+  // transparently moving data directly into our buffer.  In that
+  // case, the writer will send us a DATA pseudo-packet, to indicate
+  // when the RDMA is complete.  (And we already told the writer how
+  // big our buffer is, so the DATA packet won't indicate a size
+  // bigger than that.)  If we get an actual EOF on the socket, that's
+  // an error; the server should send DATA 0, to indicate an EOF on
+  // file-data.
+
+   PseudoPacketHeader header;
+   NEED_0( read_pseudo_packet_header(handle, &header) );
+   if (header.command != CMD_DATA) {
+      neERR("unexpected pseudo-packet: %s\n", command_str(header.command));
+      return -1;
+   }
+
+   return header.size;
+
+#else
+   return read_buffer_internal(handle->peer_fd, buf, size, 1);
+
+#endif
+
+}
+
+
 
 
 // write bytes until <size>, or error.
 // Return 0 for success, negative for error.
 //
-// WARNING: Do not use this to jam arbitrary amounts of data into a
-//    socket that might use RIOWRITE.  write_buffer() can be used to
-//    assure that the reader's request-amount is fully written, but
-//    not to assure that the writer's buffer is fully written.  See
-//    skt_write() for better understanding.
+// NOTE: Regarding the separation of write_buffer_to_file() and
+//     write_buffer_to_socket(), see comments above
+//     read_buffer_from_file().
 //
-// NOTE: If <size>==0, the server will treat it as EOF.
-//
-// NOTE: In order to reliably weave remote-fsync into the protocol,
-//    skt_fsync() just sets a flag in the handle.  The next call to skt_write()
-//    
-//    copy_file_to_socket()
-
-int write_buffer(int fd, const char* buf, size_t size, int is_socket, off_t offset) {
-  neDBG("write_buffer(%d, 0x%llx, %lld, skt:%d, off:0x%llx)\n", fd, buf, size, is_socket, offset);
+static
+int write_buffer_internal(int fd, const char* buf, size_t size, int is_socket, off_t offset) {
+  neDBG("write_buffer(%d, 0x%llx, %lld, off:0x%llx)\n", fd, buf, size, offset);
 
   const char*  write_ptr     = buf;
   size_t       write_remain  = size;
@@ -261,25 +276,41 @@ int write_buffer(int fd, const char* buf, size_t size, int is_socket, off_t offs
     else if (errno == EPIPE) {
       neDBG("client disconnected?\n");
       return -1;
-      break;
     }
     else if (errno) {
       perror("write failed\n");
       return -1;
-      break;
     }
 #endif
   }
-  neDBG("write_total: %lld\n", write_total);
 
+  neDBG("write_total: %lld\n", write_total);
+  return 0;
+}
+
+
+int write_buffer_to_file(int fd, const char* buf, size_t size) {
+   return write_buffer_internal(fd, buf, size, 0, (off_t)0);
+}
+
+
+// WARNING: Do not use this to jam arbitrary amounts of data into a
+//    socket that might use RIOWRITE.  This can can be used to
+//    assure that the reader's request-amount is fully written, but
+//    not to assure that the writer's buffer is fully written.  See
+//    skt_write() for better understanding.
+//
+// NOTE: If <size>==0, the server will treat it as EOF.
+
+int write_buffer_to_socket(SocketHandle* handle, const char* buf, size_t size) {
+
+   NEED_0( write_buffer_internal(handle->peer_fd, buf, size, 1, handle->rio_offset) );
 
 #ifdef USE_RIOWRITE
-  if (is_socket) {
-     NEED_0( write_pseudo_packet(fd, CMD_DATA, size, NULL) );
-  }
+   NEED_0( write_pseudo_packet(handle, CMD_DATA, size, NULL) );
 #endif
 
-  return 0;
+   return 0;
 }
 
 
@@ -288,7 +319,8 @@ int write_buffer(int fd, const char* buf, size_t size, int is_socket, off_t offs
 
 
 
-// for small socket-reads that don't use RDMA
+// for small socket-reads that don't use RDMA -- typically, control-channel
+// pseudo-packets.
 //
 // BACKGROUND: We previously used blocking requests, but they continue to
 //     hang, after a client is killed.  The reaper-task was added to come
@@ -329,6 +361,11 @@ int write_buffer(int fd, const char* buf, size_t size, int is_socket, off_t offs
 //     in the event of an undetected peer-failure, but allows
 //     non-disastrous read-performance, in the meantime.
 //
+// Another problem (RHEL 6.6).  Sometimes, one peer sends a message which
+// the other end never sees.  It doesn't show up via rselect or recv().
+// (No, I'm not using SOCK_DGRAM.)  In this situation, I don't see what
+// else we can do but timeout.  Unfortunately, it seems to happen often.
+//
 // TBD: As loads grow on the server, this might want to do something
 //     like write_buffer() does, to handle incomplete writes.
 
@@ -343,52 +380,63 @@ int read_raw(int fd, char* buf, size_t size) {
    FD_ZERO(&rd_fds);
    FD_SET(fd, &rd_fds);
 
-   int  sec;
+   // static const unsigned long usec_per_it = 1000; // 1 ms per SELECT()
+   static const unsigned long usec_per_it = 1000000 -1; // ~1 sec per SELECT()
+   unsigned long it_count = ((RD_TIMEOUT * 1000000UL) / usec_per_it);
+   neDBG("it_count: %lu\n", it_count);
+
    rc = 0;
-   for (sec=0; (rc>=0 && sec<RD_TIMEOUT); ++sec) {
+   unsigned long  it;
+   for (it=0; (rc>=0 && it<it_count); ++it) {
 
 #if 0
       // --- wait for the fd to have data
       //    (see comment about race-condition)
-      if (sec) {
+      if (it) {
          do {
-            tv.tv_sec  = 1;
-            tv.tv_usec = 0;
+            tv.tv_sec  = 0;
+            tv.tv_usec = usec_per_it;
             rc = SELECT(fd +1, &rd_fds, NULL, NULL, &tv); // side-effect on <tv>
          } while ((rc < 0) && (errno == EINTR));
 
          if (rc < 0) {
-            neERR("select failed (iter: %d)\n", sec);
+            neERR("select failed (iter: %d)\n", it);
             errno = EIO;
             return -1;
          }
          //        neDBG("[%d] select returned %d, with %ld.%06ld sec remaining\n",
-         //              sec, rc, tv.tv_sec, tv.tv_usec);
+         //              it, rc, tv.tv_sec, tv.tv_usec);
       }
 
 
+      if (rc)
+         neDBG("Got one\n");
+
       // --- try the read
       ssize_t read_count = RECV(fd, buf, size, MSG_DONTWAIT);
+
+      if (rc)
+         neDBG("read_count after select: %lld\n", read_count);
 #else
       ssize_t read_count = RECV(fd, buf, size, MSG_WAITALL);
 #endif
 
       if (read_count == size) {
-         neDBG("read OK (iter: %d)\n", sec);
+         neDBG("read OK (iter: %d)\n", it);
          return 0;
       }
       else if (! read_count) {
-         neERR("read EOF (iter: %d)\n", sec);
+         neERR("read EOF (iter: %d)\n", it);
          return -1;             // you called read_raw() expecting something
       }
       else if (read_count > 0) {
          neERR("read %lld instead of %lld bytes (iter: %d)\n",
-               read_count, size, sec);
+               read_count, size, it);
          return -1;
       }
       else if ((errno != EAGAIN)
                && (errno != EWOULDBLOCK)) {
-         neERR("read failed (iter: %d)\n", sec);
+         neERR("read failed (iter: %d)\n", it);
          return -1;
       }
    }
@@ -420,23 +468,28 @@ int write_raw(int fd, char* buf, size_t size) {
    FD_ZERO(&wr_fds);
    FD_SET(fd, &wr_fds);
 
-   int  sec;
+   // static const unsigned long usec_per_it = 1000; // 1 ms per SELECT()
+   static const unsigned long usec_per_it = 1000000 -1; // ~1 sec per SELECT()
+   unsigned long it_count = ((WR_TIMEOUT * 1000000UL) / usec_per_it);
+   neDBG("it_count: %lu\n", it_count);
+
    rc = 0;
-   for (sec=0; (rc>=0 && sec<WR_TIMEOUT); ++sec) {
+   unsigned long  it;
+   for (it=0; (rc>=0 && it<it_count); ++it) {
 
 #if 0
       // --- wait for the fd to have room
       //    (see comment about race-condition)
-      if (sec) {
+      if (it) {
          do {
-            tv.tv_sec  = 1;
-            tv.tv_usec = 0;
+            tv.tv_sec  = 0;
+            tv.tv_usec = usec_per_it;
             rc = SELECT(fd +1, NULL, &wr_fds, NULL, &tv); // side-effect on <tv>
          } while ((rc < 0) && (errno == EINTR));
 
 
          if (rc < 0) {
-            neERR("select failed (iter: %d)\n", sec);
+            neERR("select failed (iter: %d)\n", it);
             errno = EIO;
             return -1;
          }
@@ -444,30 +497,34 @@ int write_raw(int fd, char* buf, size_t size) {
          //              sec, rc, tv.tv_sec, tv.tv_usec);
       }
 
+      if (rc)
+         neDBG("Got one\n");
+
       // --- try the write
-      // ssize_t write_count = WRITE(fd, buf, size);
-      // ssize_t write_count = SEND(fd, buf, size, 0); // TBD: flags?
       ssize_t write_count = SEND(fd, buf, size, MSG_DONTWAIT);
+
+      if (rc)
+         neDBG("write_count after select: %lld\n", write_count);
 #else
       ssize_t write_count = SEND(fd, buf, size, MSG_WAITALL);
 #endif
 
       if (write_count == size) {
-         neDBG("write OK (iter: %d)\n", sec);
+         neDBG("write OK (iter: %d)\n", it);
          return 0;
       }
       else if (! write_count) {
-         neERR("write EOF (iter: %d)\n", sec);
+         neERR("write EOF (iter: %d)\n", it);
          return -1;
       }
       else if (write_count > 0) {
          neERR("write %lld instead of %lld bytes (iter: %d)\n",
-               write_count, size, sec);
+               write_count, size, it);
          return -1;
       }
       else if ((errno != EAGAIN)
                && (errno != EWOULDBLOCK)) {
-         neERR("write failed (iter: %d)\n", sec);
+         neERR("write failed (iter: %d)\n", it);
          return -1;
       }
    }
@@ -610,10 +667,11 @@ const char* command_str(SocketCommand command) {
 }
 
 
-// for now, this is only used by client
+
 // NOTE: We take care of network-byte-order conversions
-int write_pseudo_packet(int fd, SocketCommand command, size_t size, void* buf) {
+int write_pseudo_packet(SocketHandle* handle, SocketCommand command, size_t size, void* buf) {
   ssize_t write_count;
+  int     fd = handle->peer_fd;
 
   // --- write <command>
   neDBG("-> command: %s\n", command_str(command));
@@ -638,10 +696,21 @@ int write_pseudo_packet(int fd, SocketCommand command, size_t size, void* buf) {
   return 0;
 }
 
-// for now, this is only used by server
+
 // NOTE: We take care of network-byte-order conversions
-int read_pseudo_packet_header(int fd, PseudoPacketHeader* hdr) {
+int read_pseudo_packet_header(SocketHandle* handle, PseudoPacketHeader* hdr) {
+
+   // check for previously-read header that was "unread"
+   if (handle->flags & HNDL_READ_AHEAD) {
+      *hdr = handle->read_ahead;
+      handle->flags &= ~HNDL_READ_AHEAD;
+      neDBG("<- (cached) command: %s\n", command_str(hdr->command));
+      neDBG("<- (cached) size:  %lld\n", hdr->size);
+      return 0;
+   }
+
   ssize_t read_count;
+  int     fd = handle->peer_fd;
   memset(hdr, 0, sizeof(PseudoPacketHeader));
 
   // --- read <command>
@@ -659,6 +728,18 @@ int read_pseudo_packet_header(int fd, PseudoPacketHeader* hdr) {
 
   return 0;
 }
+
+// For example, copy_file_to_socket() calls read_pseduo_packet_header() to
+// check for a SEEK from the peer (instead of the ACK that will be expected
+// by skt_write()).  If it does find the ACK, it unreads that, so that it
+// can later be "read" in skt_write().
+//
+int unread_pseudo_packet_header(SocketHandle* handle, PseudoPacketHeader* hdr) {
+   handle->read_ahead = *hdr;
+   handle->flags |= HNDL_READ_AHEAD;
+   return 0;
+}
+
 
 
 // paths to the server can be specified as  host:port/path/to/file
@@ -755,6 +836,14 @@ int parse_service_path(PathSpec* spec, const char* service_path) {
 // seeks as an optional CMD_SEEK_SET pseudo-header, sent by the reader
 // before the ACK.
 //
+// UPDATE: libne actually calls seek quite frequently, typically seeking
+//    backwards by 1M.  We could keep previous buffers and just return
+//    them, in this common case.  Instead, we're picking a more-generic
+//    solution.  We peek for the SEEK.  If it's found, then do the seek
+//    before reading from file (or use pread()).  If, instead, the
+//    control-channel just has the ACK (in which the client is requesting a
+//    continuation of sequential reads in the GET-stream), then do that.
+
 // NOTE: if the client calls lseek() after we have detected EOF on the
 //    input-file, we need to detect that and resume reading.  We can't exit
 //    this function until we're sure that that won't happen.  skt_write()
@@ -762,134 +851,173 @@ int parse_service_path(PathSpec* spec, const char* service_path) {
 //    the final DATA 0 to the peer, assuring that they don't interrupt with
 //    a SEEK, etc.  This means we've done part of the work of skt_close(),
 //    so we set a flag in the handle, so that skt_close() will know.
-//   
+//
 
 ssize_t copy_file_to_socket(int fd, SocketHandle* handle, char* buf, size_t size) {
 
 #ifdef SKIP_FILE_READS
   // This allows cutting out the performance cost of doing file reads
+  // for raw bandwidth tests.
   size_t iters = SKIP_FILE_READS; // we will write (SKIP_FILE_READ * <size>) bytes
 
   // initialize once, to allow diagnosis of results?
   memset(buf, 1, size);
 #endif
 
-  size_t bytes_moved = 0;       /* total */
-  int    eof         = 0;       // EOF reading file
-  int    peer_eof    = 0;       // EOF writing peer
-  int    err         = 0;
 
-  while (!eof && !peer_eof && !err) {
 
-    // --- read from file (unless file-reads are suppressed)
+  int     file_eof     = 0;     // EOF reading file
+  int     peer_eof     = 0;     // EOF writing peer
+  int     err          = 0;
+
+  size_t  read_pos     = 0;     // file reads
+  ssize_t read_count   = 0;
+
+  int     do_file_read = 1;
+  size_t  remain       = size;
+  size_t  copied       = 0;
+
+  size_t  bytes_moved  = 0;     // total
+
+
+  while (!peer_eof && !err) {
+
+     do_file_read = 1;
+
+     // --- peek at the next pseudo-packet, to see if it's a SEEK
+     PseudoPacketHeader header;
+     NEED_0( read_pseudo_packet_header(handle, &header) );
+
+     while (header.command == CMD_SEEK_SET) {
+        neDBG("got SEEK %lld\n", header.size);
+        handle->seek_pos = header.size;
+
+
+        // maybe the seek is a no-op?
+        if (handle->seek_pos == handle->stream_pos) {
+           neDBG("already at seek-pos.  Ignoring\n");
+
+           // peer gets the return-code from lseek()
+           NEED_0( write_pseudo_packet(handle, CMD_RETURN, handle->stream_pos, NULL) );
+           do_file_read = 1;
+        }
+
+        // maybe the seek is within the buffer we read previously?
+        else if ((handle->seek_pos >= read_pos)
+                 && (handle->seek_pos < handle->stream_pos)) {
+
+              copied = handle->seek_pos   - read_pos;
+              remain = handle->stream_pos - handle->seek_pos;
+
+              handle->stream_pos = handle->seek_pos;
+              neDBG("seek_pos is in existing buffer, at local offset %lld (length %lld)\n",
+                    copied, remain);
+
+              // peer gets the return-code from lseek()
+              NEED_0( write_pseudo_packet(handle, CMD_RETURN, handle->stream_pos, NULL) );
+              do_file_read = 0;
+        }
+        else {
+           // Do the seek.
+           //
+           // TBD: File-reading (further down), could just pread() from
+           //     this position, saving the need for a separate seek, but
+           //     then we'd have to take care to return appropriately for
+           //     the seek(), analyzing the results of the pread().  For
+           //     now, we'll just do the seek explicitly.
+
+           off_t rc = lseek(fd, handle->seek_pos, SEEK_SET);
+           
+           // peer gets the return-code from lseek()
+           NEED_0( write_pseudo_packet(handle, CMD_RETURN, rc, NULL) );
+
+           NEED( rc != (off_t)-1 );
+           handle->stream_pos = rc;
+           do_file_read = 1;
+        }
+
+        // peek again
+        NEED_0( read_pseudo_packet_header(handle, &header) );
+     }
+
+     // "unread" the non-SEEK pseudo-packet
+     NEED_0( unread_pseudo_packet_header(handle, &header) );
+
+     
+
+
+    // --- read from file
+    //     (seek might be re-using buffer from previous read)
+    if (do_file_read) {
+
 #ifdef SKIP_FILE_READS
-    // File-reads suppressed.  Don't bother reading.  Just send a raw buffer.
-    ssize_t read_count  = size;
+       // File-reads suppressed.  Don't bother reading.  Just send a raw buffer.
+       if (unlikely(iters-- <= 0)) {
+          neDBG("fake EOF\n");
+          file_eof = 1;
+          read_count  = 0;
+          break;
+       }
+       neDBG("%d: fake read: %lld\n", iters, read_count);
 
-    if (unlikely(iters-- <= 0)) {
-      neDBG("fake EOF\n");
-      eof = 1;
-      read_count  = 0;
-      break;
-    }
-    neDBG("%d: fake read: %lld\n", iters, read_count);
+       read_count = size;
+       remain     = read_count;
+       copied     = 0;
 
 #else
-    // read data up to <size>, or EOF
-    size_t  read_pos   = handle->stream_pos;
-    ssize_t read_count = read_buffer(fd, buf, size, 0);
-    neDBG("read_count: %lld\n", read_count);
-    NEED( read_count >= 0 );
+       // read file data up to <size>, or EOF
+       read_pos   = handle->stream_pos;
+       read_count = read_buffer_from_file(fd, buf, size);
+       neDBG("read_pos:   %lld\n", read_pos);
+       neDBG("read_count: %lld\n", read_count);
+       NEED( read_count >= 0 );
 
-    //#   ifdef DEBUG_SOCKETS
-    //    // DEBUGGING: chasing readback problems.
-    //    if (read_count > 0) {
-    //       char  dbg_buf[128];
-    //       char* dbg_bufp = dbg_buf;
-    //       int   i;
-    //       for (i=0; i<32; ++i) {
-    //
-    //          if (i && !(i%4))
-    //             *(dbg_bufp++) = ' ';
-    //
-    //          int j;
-    //          for (j=0; j<2; ++j) {
-    //             uint8_t nybble = (buf[i] >> ((1-j)*4)) & 0x0f;
-    //             if (nybble < 10)
-    //                *(dbg_bufp++) = nybble | '0';
-    //             else
-    //                *(dbg_bufp++) = ((nybble - 10) | ((uint8_t)'a' -1)) +1; /* 'a' = 0x61 */
-    //          }
-    //          *(dbg_bufp++) = ',';
-    //       }
-    //       *(dbg_bufp++) = 0;
-    //       neDBG("pos: %llu, dbg_buf=%s\n", read_pos, dbg_buf);
-    //    }
-    //#   endif
+       // #   ifdef DEBUG_SOCKETS
+       //        // DEBUGGING: chasing readback problems.
+       //        if (read_count > 0) {
+       //           char  dbg_buf[128];
+       //           char* dbg_bufp = dbg_buf;
+       //           int   i;
+       //           for (i=0; i<32; ++i) {
+       //              
+       //              if (i && !(i%4))
+       //                 *(dbg_bufp++) = ' ';
+       //              
+       //              int j;
+       //              for (j=0; j<2; ++j) {
+       //                 uint8_t nybble = (buf[i] >> ((1-j)*4)) & 0x0f;
+       //                 if (nybble < 10)
+       //                    *(dbg_bufp++) = nybble | '0';
+       //                 else
+       //                    *(dbg_bufp++) = ((nybble - 10) | ((uint8_t)'a' -1)) +1; /* 'a' = 0x61 */
+       //              }
+       //              *(dbg_bufp++) = ',';
+       //           }
+       //           *(dbg_bufp++) = 0;
+       //           neDBG("pos: %llu, dbg_buf=%s\n", read_pos, dbg_buf);
+       //        }
+       // #   endif
 
-    if (read_count == 0) {
-      neDBG("read EOF\n");
+       if (read_count == 0) {
+          neDBG("read EOF\n");
 
-      ///#  ifdef USE_RIOWRITE
-      ///      // make sure client isn't going to seek.
-      ///      // We can't quit until we've seen the ACK 0 from her skt_close() call.
-      ///      // 
-      ///      PseudoPacketHeader header;
-      ///      NEED_0( read_pseudo_packet_header(handle->peer_fd, &header) );
-      ///
-      ///      while (header.command != CMD_ACK) {
-      ///
-      ///         // (This is analogous to the FSYNC-handling inside skt_read().)
-      ///         // SEEK here means client is calling skt_lseek(), and skt_write()
-      ///         // is called from copy_file_to_socket(), supporting a GET on the
-      ///         // server-side.  Therefore, the <fd> that the seek is intended for
-      ///         // is for the file, not this handle.  We don't have access to that
-      ///         // fd, which is why we have to throw an error back to
-      ///         // copy_file_to_socket().
-      ///
-      ///         if (header.command == CMD_SEEK_SET) {
-      ///            neDBG("got SEEK %lld\n", header.size);
-      ///            off_t rc = lseek(fd, handle->seek_pos, SEEK_SET);
-      ///
-      ///            // peer gets the return-code from lseek()
-      ///            NEED_0( write_pseudo_packet(handle->peer_fd, CMD_RETURN, rc, NULL) );
-      ///            NEED( rc != (off_t)-1 );
-      ///         }
-      ///         else if (header.command == CMD_RIO_OFFSET) {
-      ///            neDBG("got RIO_OFFSET: 0x%llx\n", header.size);
-      ///            handle->rio_offset = header.size;
-      ///         }
-      ///         else {
-      ///            neERR("expected ACK, but got %s\n", command_str(header.command));
-      ///            return -1;
-      ///         }
-      ///
-      ///         // read another pseudo-packet, until we fail, or get an ACK
-      ///         NEED_0( read_pseudo_packet_header(handle->peer_fd, &header) );
-      ///      }
-      ///
-      ///#  endif
-      ///
-      ///      // Got an ACK from the reader (peer).
-      ///      // Now we can send our DATA 0 and quit.
-      ///      NEED_0( write_pseudo_packet(handle->peer_fd, CMD_DATA, 0, NULL) );
-      ///      eof = 1;
-      ///      break;
+          // We want to send a DATA 0, to tell the peer that we are done.  But
+          // peer may still seek back into the stream.  We can now use
+          // skt_write() to probe for, and handle, any SEEKs, RIO_OFFSETS, or
+          // ACK 0 that might be sent from the peer, after we have reached EOF
+          // on our input-file.  We'll do that in the write section, below.
+          file_eof = 1;
+       }
 
-
-      // We want to send a DATA 0, to tell the peer that we are done.  But
-      // peer may still seek back into the stream.  We can now use
-      // skt_write() to probe for, and handle, any SEEKs, RIO_OFFSETS, or
-      // ACK 0 that might be sent from the peer, after we have reached EOF
-      // on our input-file.  We'll do that in the write section, below.
-      eof = 1;
+       remain = read_count;
+       copied = 0;
+#endif
     }
 
-#endif
 
-    // --- copy all of buffer to socket
+    // --- copy file-data out on socket
     //
-    // NOTE: Do not use write_buffer(handle->peer_fd, ... )
+    // NOTE: Do not use write_buffer(handle, ... )
     //
     // NOTE: We are copying a continuous stream from the file to the
     //    socket.  We only discover seeks from the client when skt_write()
@@ -904,16 +1032,18 @@ ssize_t copy_file_to_socket(int fd, SocketHandle* handle, char* buf, size_t size
     //    seek like that, but we can probably just wait until that gets
     //    fixed.
 
-    size_t remain = read_count;
-    size_t copied = 0;
-    while (remain || eof) {
+    while (remain || file_eof) {
       ssize_t write_count = skt_write(handle, buf+copied, remain);
 
       if (unlikely(write_count < 0)) {
 
         if (handle->flags & HNDL_SEEK_SET) {
+
+           // Apparently, this may still happen, despite the read-ahead for
+           // SEEKs at the top of the outer loop.
+
            neDBG("write 'failed' due to SEEK.  from %lld to %lld\n",
-               handle->stream_pos, handle->seek_pos);
+                 handle->stream_pos, handle->seek_pos);
            handle->flags &= ~(HNDL_SEEK_SET);
 
            // maybe the seek is within the buffer we just read?
@@ -925,33 +1055,37 @@ ssize_t copy_file_to_socket(int fd, SocketHandle* handle, char* buf, size_t size
 
               handle->stream_pos = handle->seek_pos;
               neDBG("seek_pos is in existing buffer, at local offset %lld (length %lld)\n",
-                  copied, remain);
+                    copied, remain);
+
+              // peer gets the return-code from lseek()
+              NEED_0( write_pseudo_packet(handle, CMD_RETURN, handle->stream_pos, NULL) );
               continue;
            }
 
            off_t rc = lseek(fd, handle->seek_pos, SEEK_SET);
            neDBG("lseek returned: %lld\n", (ssize_t)rc);
-           if (eof && (rc != (off_t)-1) && (rc != handle->stream_pos)) {
+           if (file_eof && (rc != (off_t)-1) && (rc != handle->stream_pos)) {
               neDBG("SEEK after EOF, ready for more reading at %lld\n",
-                  handle->seek_pos);
-              eof = 0;           // more file-reading to do
+                    handle->seek_pos);
+              file_eof = 0;     // more file-reading to do
            }
            handle->stream_pos = handle->seek_pos;
 
            // peer gets the return-code from lseek()
-           NEED_0( write_pseudo_packet(handle->peer_fd, CMD_RETURN, rc, NULL) );
+           NEED_0( write_pseudo_packet(handle, CMD_RETURN, rc, NULL) );
            NEED( rc != (off_t)-1 );
-           read_count = 0;       // don't add read_count to bytes_moved
+           read_count = 0;      // don't increment bytes_moved
            break;
         }
         else if (handle->flags & HNDL_PEER_EOF) {
            neDBG("write failed due to peer EOF\n");
            peer_eof = 1;
+           read_count = 0;      // don't increment bytes_moved
            break;
         }
 
         neERR("write failed: moved: %llu, read_ct: %lld, remain: %llu, flags: 0x%04x\n",
-            bytes_moved, read_count, remain, handle->flags);
+              bytes_moved, read_count, remain, handle->flags);
         return -1;
       }
 
@@ -1009,7 +1143,7 @@ ssize_t copy_socket_to_file(SocketHandle* handle, int fd, char* buf, size_t size
         ssize_t rc = fsync(fd);
 
         // peer gets the return-code from fsync()
-        NEED_0( write_pseudo_packet(handle->peer_fd, CMD_RETURN, rc, NULL) );
+        NEED_0( write_pseudo_packet(handle, CMD_RETURN, rc, NULL) );
         NEED_0( rc );
         continue;
       }
@@ -1031,7 +1165,7 @@ ssize_t copy_socket_to_file(SocketHandle* handle, int fd, char* buf, size_t size
     neDBG("fake write: %lld\n", read_count);
 #else
     // copy all of buffer to file
-    NEED_0( write_buffer(fd, buf, read_count, 0, 0) );
+    NEED_0( write_buffer_to_file(fd, buf, read_count) );
     neDBG("copied out\n");
 #endif
 
@@ -1169,11 +1303,11 @@ int client_s3_authenticate_internal(SocketHandle* handle, int command) {
    // --- send to server
    size_t data_size = (ptr - s3_data);
    neDBG("data_sz:    %lld\n", data_size);
-   NEED_0( write_pseudo_packet(handle->peer_fd, CMD_S3_AUTH, data_size, s3_data) );
+   NEED_0( write_pseudo_packet(handle, CMD_S3_AUTH, data_size, s3_data) );
 
    // --- get reply
    PseudoPacketHeader header;
-   NEED_0( read_pseudo_packet_header(handle->peer_fd, &header) );
+   NEED_0( read_pseudo_packet_header(handle, &header) );
    if (header.command != CMD_RETURN) {
       neERR("expected RETURN pseudo-packet, not %s\n", command_str(header.command));
       return -1;
@@ -1214,17 +1348,18 @@ int client_s3_authenticate(SocketHandle* handle, int command) {
 
    int retval = client_s3_authenticate_internal(handle, command);
 
-#ifdef DEBUG_SOCKETS
    AWSContext*    aws_ctx = handle->aws_ctx;
    const char*    user_name = (aws_ctx ? aws_ctx->awsKeyID : SKT_S3_USER);
    PathSpec*      spec = &handle->path_spec;
 
-   neDBG("-- AUTHENTICATION: %s for user=%s %s %s\n",
-         (retval ? "FAIL" : "OK"),
-         user_name,
-         command_str(command),
-         spec->fname);
-#endif
+   // log auth failures
+   if (retval)
+      neLOG("-- AUTHENTICATION: FAIL for user=%s %s %s\n",
+            user_name, command_str(command), spec->fname);
+   else
+      neDBG("-- AUTHENTICATION: OK   for user=%s %s %s\n",
+            user_name, command_str(command), spec->fname);
+
 
    if (needs_free)
       aws_context_free_r(handle->aws_ctx);
@@ -1440,10 +1575,10 @@ int  skt_open (SocketHandle* handle, const char* service_path, int flags, ...) {
 // NOTE: The peer understands DATA 0 to mean EOF, in the sense that this is
 //     our last communication on the connection.  We will send that in
 //     skt_close().  Therefore, if someone calls skt_write() with <size> 0,
-//     we'll treat it as a no-op.
+//     we'll treat it as a no-op, rather than sending the DATA 0.
 //
-//     UPDATE: When it is trying to be sure that the client is not seeking
-//     back into the file for more reading, copy_file_to_socket()
+//     UPDATE: When it is trying to be sure that the client is not going to
+//     seek back into the file for more reading, copy_file_to_socket()
 //     [supporting the server-side of GET] would have to duplicate much of
 //     our handling of potential SEEK and RIO_OFFSET pseudo-packets sent
 //     from the peer.  (But the problem would be harder, because it
@@ -1614,11 +1749,11 @@ int basic_init(SocketHandle* handle, SocketCommand cmd) {
     handle->flags |= HNDL_OP_INIT;
 
     if (cmd != CMD_NULL) {
-      PathSpec* spec = &handle->path_spec;
 #if S3_AUTH
       NEED_0( client_s3_authenticate(handle, cmd) );
 #else
-      NEED_0( write_pseudo_packet(handle->peer_fd, cmd, strlen(spec->fname)+1, spec->fname) );
+      PathSpec* spec = &handle->path_spec;
+      NEED_0( write_pseudo_packet(handle, cmd, strlen(spec->fname)+1, spec->fname) );
 #endif
     }
   }
@@ -1652,7 +1787,7 @@ int write_init(SocketHandle* handle, SocketCommand cmd) {
 #if USE_RIOWRITE
     // server sends us the offset she got from riomap()
     PseudoPacketHeader header;
-    NEED_0( read_pseudo_packet_header(handle->peer_fd, &header) );
+    NEED_0( read_pseudo_packet_header(handle, &header) );
     if (header.command != CMD_RIO_OFFSET) {
       neERR("expected RIO_OFFSET pseudo-packet, not %s\n", command_str(header.command));
       return -1;
@@ -1684,17 +1819,25 @@ ssize_t skt_write(SocketHandle* handle, const void* buf, size_t size) {
   // Don't call write_buffer() until the other-end reports that it
   // is finished with the buffer.
   PseudoPacketHeader header;
-  NEED_0( read_pseudo_packet_header(handle->peer_fd, &header) );
+  NEED_0( read_pseudo_packet_header(handle, &header) );
 
   if (unlikely (header.command != CMD_ACK)) {
 
-    // (This is analogous to the FSYNC-handling inside skt_read().)
-    // SEEK here means client is calling skt_lseek(), and skt_write()
-    // is called from copy_file_to_socket(), supporting a GET on the
-    // server-side.  Therefore, the <fd> that the seek is intended for
-    // is for the file, not this handle.  We don't have access to that
-    // fd, which is why we have to throw an error back to
-    // copy_file_to_socket().
+     // (This is analogous to the FSYNC-handling inside skt_read().)  SEEK
+     // here means client is calling skt_lseek(), and skt_write() is called
+     // from copy_file_to_socket(), supporting a GET on the server-side.
+     // Therefore, the <fd> for which the seek is intended is for the file,
+     // not this handle.  We don't have access to the file fd, which is why
+     // we have to throw an error back to copy_file_to_socket().
+     //
+     // This approach is symmetrical with the handling of FSYNC in
+     // skt_read(), which supports copy_socket_to_file(), but in our case
+     // it implies that copy_file_to_socket() would go back and re-read
+     // data that previously read, because it was expecting sequential
+     // reads from the client.  libne actually does a lot of seeks, making
+     // this approach wasteful.  copy_file_to_socket() therefore now does a
+     // read-ahead to find that SEEK pseudo-packet.  Therefore, the test
+     // for SEEK here is probably obsolete.
 
     if (header.command == CMD_SEEK_SET) {
       handle->flags |= HNDL_SEEK_SET;
@@ -1732,7 +1875,7 @@ ssize_t skt_write(SocketHandle* handle, const void* buf, size_t size) {
 
 
   // write_buffer() is okay here, because we know how much the peer can handle
-  NEED_0( write_buffer(handle->peer_fd, buf, size, 1, handle->rio_offset) );
+  NEED_0( write_buffer_to_socket(handle, buf, size) );
   handle->stream_pos += size;  /* tracking for skt_lseek() */
 
   // copy_file_to_socket() now uses skt_write() to handle complications
@@ -1803,6 +1946,9 @@ ssize_t skt_write_all(SocketHandle* handle, const void* buffer, size_t size) {
 // handle.  This allows skt_read() to adjust dynamically to different
 // buffer sizes, and allows skt_lseek() to fake it by invoking a server-side
 // GET thread on its own, and providing a fake
+//
+// We disable thread-cancelling briefly, so a thread-shutdown won't find
+// itself with an inconsistent handle that it's trying to close, etc.
 
 int riomap_reader(SocketHandle* handle, void* buf, size_t size) {
 
@@ -1847,7 +1993,7 @@ int riomap_reader(SocketHandle* handle, void* buf, size_t size) {
   handle->flags |= HNDL_RIOMAPPED;
   THREAD_CANCEL(ENABLE);
 
-  NEED_0( write_pseudo_packet(handle->peer_fd, CMD_RIO_OFFSET, handle->rio_offset, NULL) );
+  NEED_0( write_pseudo_packet(handle, CMD_RIO_OFFSET, handle->rio_offset, NULL) );
 #endif
 
   return 0;
@@ -1910,13 +2056,13 @@ ssize_t skt_read(SocketHandle* handle, void* buf, size_t size) {
   // tell peer we are done with buffer, so she can begin overwriting
   // with her next riowrite().  We also indicate the maximum amount we
   // can recv.
-  NEED_0( write_pseudo_packet(handle->peer_fd, CMD_ACK, size, NULL) );
+  NEED_0( write_pseudo_packet(handle, CMD_ACK, size, NULL) );
 
 
   // wait for peer to finish riowrite()
   // NOTE: we may optionally receive an FSYNC, before the DATA
   PseudoPacketHeader header;
-  NEED_0( read_pseudo_packet_header(handle->peer_fd, &header) );
+  NEED_0( read_pseudo_packet_header(handle, &header) );
 
   if (unlikely(header.command != CMD_DATA)) {
 
@@ -1942,7 +2088,7 @@ ssize_t skt_read(SocketHandle* handle, void* buf, size_t size) {
   read_count = header.size;
 
 #else
-  read_count = read_buffer(handle->peer_fd, buf, size, 1);
+  read_count = read_buffer_from_socket(handle, buf, size);
 
 #endif
 
@@ -2078,12 +2224,12 @@ off_t skt_lseek(SocketHandle* handle, off_t offset, int whence) {
   char  dummy[1];
   NEED_0( read_init(handle, CMD_GET, dummy, 1) );
 
-  NEED_0( write_pseudo_packet(handle->peer_fd, CMD_SEEK_SET, seek_pos, NULL) );
+  NEED_0( write_pseudo_packet(handle, CMD_SEEK_SET, seek_pos, NULL) );
 
 
   // wait for peer to respond
   PseudoPacketHeader header;
-  NEED_0( read_pseudo_packet_header(handle->peer_fd, &header) );
+  NEED_0( read_pseudo_packet_header(handle, &header) );
   if (unlikely(header.command != CMD_RETURN)) {
     neERR("expected RETURN, but got %s\n", command_str(header.command));
     return -1;
@@ -2140,7 +2286,7 @@ int skt_fsync(SocketHandle* handle) {
   }
 
   PseudoPacketHeader header;
-  NEED_0( read_pseudo_packet_header(handle->peer_fd, &header) );
+  NEED_0( read_pseudo_packet_header(handle, &header) );
 
   // this ACK was intended for skt_write()
   if (unlikely(header.command != CMD_ACK)) {
@@ -2148,10 +2294,10 @@ int skt_fsync(SocketHandle* handle) {
     return -1;
   }
 
-  NEED_0( write_pseudo_packet(handle->peer_fd, CMD_FSYNC, 1, NULL) );
+  NEED_0( write_pseudo_packet(handle, CMD_FSYNC, 1, NULL) );
 
   // wait for peer to finish the fsync
-  NEED_0( read_pseudo_packet_header(handle->peer_fd, &header) );
+  NEED_0( read_pseudo_packet_header(handle, &header) );
   if (unlikely(header.command != CMD_RETURN)) {
     neERR("expected RETURN, but got %s\n", command_str(header.command));
     return -1;
@@ -2196,7 +2342,7 @@ int skt_close(SocketHandle* handle) {
 #ifdef USE_RIOWRITE
             // let the other end know that there's no more data
             if (! (handle->flags & HNDL_SENT_DATA0))
-               jNEED_0( write_pseudo_packet(handle->peer_fd, CMD_DATA, 0, NULL) );
+               jNEED_0( write_pseudo_packet(handle, CMD_DATA, 0, NULL) );
 #endif
 
             // wait for the other end to fsync
@@ -2206,11 +2352,11 @@ int skt_close(SocketHandle* handle) {
             //       rather than the ACK for the DATA 0 we just wrote.  Skip
             //       over the former to get to the latter.
             PseudoPacketHeader hdr;
-            EXPECT_0( read_pseudo_packet_header(handle->peer_fd, &hdr) );
+            EXPECT_0( read_pseudo_packet_header(handle, &hdr) );
             EXPECT(   (hdr.command == CMD_ACK) );
 
             if ((hdr.command == CMD_ACK) && hdr.size) {
-               EXPECT_0( read_pseudo_packet_header(handle->peer_fd, &hdr) );
+               EXPECT_0( read_pseudo_packet_header(handle, &hdr) );
                EXPECT(   (hdr.command == CMD_ACK) );
             }
          }
@@ -2220,7 +2366,7 @@ int skt_close(SocketHandle* handle) {
 
 #ifdef USE_RIOWRITE
          // We got the DATA 0 indicating EOF.  Send an ACK 0, as a sign off.
-         jNEED_0( write_pseudo_packet(handle->peer_fd, CMD_ACK, 0, NULL) );
+         jNEED_0( write_pseudo_packet(handle, CMD_ACK, 0, NULL) );
 #endif
       }
    }
@@ -2238,7 +2384,7 @@ int skt_close(SocketHandle* handle) {
    // client-side doesn't expect NOP.
    else {
       // server spun up a listener-thread.  Let it exit gracefully
-      jNEED_0( write_pseudo_packet(handle->peer_fd, CMD_NOP, 0, NULL) );
+      jNEED_0( write_pseudo_packet(handle, CMD_NOP, 0, NULL) );
    }
 
 
@@ -2301,7 +2447,7 @@ int skt_unlink(const void* aws_ctx, const char* service_path) {
   jNEED_0( basic_init(&handle, CMD_UNLINK) );
 
   // read RETURN, providing return-code from the remote rename().
-  jNEED_0( read_pseudo_packet_header(handle.peer_fd, &hdr) );
+  jNEED_0( read_pseudo_packet_header(&handle, &hdr) );
   jNEED(   (hdr.command == CMD_RETURN) );
   int rc =   (int)hdr.size;
 
@@ -2343,7 +2489,7 @@ int  skt_chown (const void* aws_ctx, const char* service_path, uid_t uid, gid_t 
 
 
   // read RETURN, providing return-code from the remote lchown().
-  jNEED_0( read_pseudo_packet_header(handle.peer_fd, &hdr) );
+  jNEED_0( read_pseudo_packet_header(&handle, &hdr) );
   jNEED(   (hdr.command == CMD_RETURN) );
   int rc =   (int)hdr.size;
 
@@ -2414,7 +2560,7 @@ int skt_rename (const void* aws_ctx, const char* service_path, const char* new_p
   jNEED_0( write_raw(handle.peer_fd, (char*)new_fname, len) );
 
   // read RETURN, providing return-code from the remote rename().
-  jNEED_0( read_pseudo_packet_header(handle.peer_fd, &hdr) );
+  jNEED_0( read_pseudo_packet_header(&handle, &hdr) );
   jNEED(   (hdr.command == CMD_RETURN) );
   int rc =   (int)hdr.size;
 
@@ -2488,7 +2634,7 @@ int skt_stat(const void* aws_ctx, const char* service_path, struct stat* st) {
 
   // rc is sent as a pseudo-packet
   PseudoPacketHeader hdr;
-  jNEED_0( read_pseudo_packet_header(handle.peer_fd, &hdr) );
+  jNEED_0( read_pseudo_packet_header(&handle, &hdr) );
   jNEED(   (hdr.command == CMD_RETURN) );
   rc = hdr.size;
   if (rc < 0) {

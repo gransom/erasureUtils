@@ -452,10 +452,14 @@ int ne_push_user4(PerThreadContext* ctx,
 //
 // UPDATE: It's ugly to try to validate that a path-template matches the
 //     ensuing resolved-path that is needed for implementation of the
-//     actual op.  This validation would be needed to eliminate a
-//     possibility for spoofing.  Therefore, we're changing the
-//     requirements: libne will indeed have to compute the authentication
-//     hash for each of the individual N+E resolved paths.
+//     actual op.  (Otherwise, client could just send us a
+//     one-time-computed signature, based on the path-template, and we
+//     could assure that the specific path derives from the template, then
+//     validate against the template.  Actually, that sounds easy.  Hmm.)
+//     This validation would be needed to eliminate a possibility for
+//     spoofing.  Instead, we're changing the requirements: libne will
+//     indeed have to compute the authentication hash for each of the
+//     individual N+E resolved paths.
 //
 //     On the plus side, we can return to the server the fully-parsed
 //     op+path, which it can go ahead and use directly.
@@ -466,10 +470,11 @@ int ne_push_user4(PerThreadContext* ctx,
 //     non-authenticating case.  In the case of a failure, it allows us to
 //     provide a log of what was attempted.
 
-int server_s3_authenticate_internal(int client_fd, PseudoPacketHeader* hdr, char* fname, size_t fname_len, AWSContext* aws_ctx) {
+int server_s3_authenticate_internal(SocketHandle* handle, PseudoPacketHeader* hdr, char* fname, size_t fname_len, AWSContext* aws_ctx) {
    char        s3_data[MAX_S3_DATA];
    char*       ptr = s3_data;
    char*       ptr_prev = ptr; // DEBUGGING
+   int         client_fd = handle->peer_fd;
 
    // size of authentication-info
    ssize_t     size = hdr->size;
@@ -623,18 +628,24 @@ int server_s3_authenticate_internal(int client_fd, PseudoPacketHeader* hdr, char
    neDBG("  sign [srv]: %s\n", srv_signature);
 
    int retval = ( 0 - (strcmp(signature, srv_signature) != 0) ); // 0:success, -1:fail
-   neLOG("-- AUTHENTICATION: %s for user=%s %s %s\n",
-         (retval ? "FAIL" : "OK"), user_name, command_str(op), fname);
+
+   // log auth failures
+   if (retval)
+      neLOG("-- AUTHENTICATION: FAIL for user=%s %s %s\n",
+            user_name, command_str(op), fname);
+   else
+      neDBG("-- AUTHENTICATION: OK   for user=%s %s %s\n",
+            user_name, command_str(op), fname);
 
    return retval;
 }
 
 
 
-int server_s3_authenticate(ThreadContext* ctx, int client_fd, PseudoPacketHeader* hdr, char* fname, size_t fname_size) {
+int server_s3_authenticate(ThreadContext* ctx, SocketHandle* handle, PseudoPacketHeader* hdr, char* fname, size_t fname_size) {
    AWSContext aws_ctx = {0};
 
-   int rc = server_s3_authenticate_internal(client_fd, hdr, fname, fname_size, &aws_ctx);
+   int rc = server_s3_authenticate_internal(handle, hdr, fname, fname_size, &aws_ctx);
    if (rc)
       neLOG("auth failed: %s %s\n", command_str(hdr->command), (fname ? fname : "<unknown_path>"));
 
@@ -670,7 +681,7 @@ int server_s3_authenticate(ThreadContext* ctx, int client_fd, PseudoPacketHeader
 
    // this response to client just concerns the authentication, not the
    // task that they are authenticating.  Both sides now move on to that.
-   NEED_0( write_pseudo_packet(client_fd, CMD_RETURN, rc, NULL) );
+   NEED_0( write_pseudo_packet(handle, CMD_RETURN, rc, NULL) );
 
    return rc;
 }
@@ -944,7 +955,7 @@ int server_get(ThreadContext* ctx) {
   fake_open(handle, O_WRONLY, buf, SERVER_BUF_SIZE);
 
   // open local file for reading (unless file-reads are suppressed)
-#ifndef SKIP_FILE_WRITES
+#ifndef SKIP_FILE_READS
   ctx->file_fd = open(fname, (O_RDONLY));
   if (ctx->file_fd < 0) {
     neERR("couldn't open '%s' for reading: %s\n",
@@ -1006,11 +1017,11 @@ int server_chown(ThreadContext* ctx) {
   neDBG("result: %d %s\n", rc, (rc ? strerror(errno) : ""));
 
   // send RETURN with return-code
-  NEED_0( write_pseudo_packet(client_fd, CMD_RETURN, rc, NULL) );
+  NEED_0( write_pseudo_packet(handle, CMD_RETURN, rc, NULL) );
 
   //  // skt_chown() will call skt_close(), so send an ACK 0, like
   //  // we were closing a normal handle.
-  //  NEED_0( write_pseudo_packet(client_fd, CMD_ACK, 0, NULL) );
+  //  NEED_0( write_pseudo_packet(handle, CMD_ACK, 0, NULL) );
 
   // close transaction with client
   NEED_0( skt_close(handle) );
@@ -1046,11 +1057,11 @@ int server_rename(ThreadContext* ctx) {
   neDBG("rc: %d %s\n", rc, (rc ? strerror(errno) : ""));
 
   // send RETURN with return-code
-  NEED_0( write_pseudo_packet(client_fd, CMD_RETURN, rc, NULL) );
+  NEED_0( write_pseudo_packet(handle, CMD_RETURN, rc, NULL) );
 
   //  // skt_rename() will call skt_close(), so send an ACK 0, like
   //  // we were closing a normal handle.
-  //  NEED_0( write_pseudo_packet(client_fd, CMD_ACK, 0, NULL) );
+  //  NEED_0( write_pseudo_packet(handle, CMD_ACK, 0, NULL) );
 
   // finish transaction with client
   NEED_0( skt_close(handle) );
@@ -1075,11 +1086,11 @@ int server_unlink(ThreadContext* ctx) {
   neDBG("rc: %d %s\n", rc, (rc ? strerror(errno) : ""));
 
   // send RETURN with return-code
-  NEED_0( write_pseudo_packet(client_fd, CMD_RETURN, rc, NULL) );
+  NEED_0( write_pseudo_packet(handle, CMD_RETURN, rc, NULL) );
 
   //  // skt_unlink() will call skt_close(), so send an ACK 0, like
   //  // we were closing a normal handle.
-  //  NEED_0( write_pseudo_packet(client_fd, CMD_ACK, 0, NULL) );
+  //  NEED_0( write_pseudo_packet(handle, CMD_ACK, 0, NULL) );
 
   // finish transaction with client
   NEED_0( skt_close(handle) );
@@ -1156,14 +1167,14 @@ int server_stat(ThreadContext* ctx) {
     neDBG("stat failed: %s\n", strerror(errno));
 
     // (a) send RETURN with return-code == negative errno
-    NEED_0( write_pseudo_packet(handle->peer_fd, CMD_RETURN, -errno, NULL) );
+    NEED_0( write_pseudo_packet(handle, CMD_RETURN, -errno, NULL) );
   }
   else {
     // case (2), stat succeeded
     neDBG("stat OK\n");
 
     // (a) send RETURN with return-code == sizeof(struct stat), for crude validation
-    jNEED_0( write_pseudo_packet(handle->peer_fd, CMD_RETURN, sizeof(struct stat), NULL) );
+    jNEED_0( write_pseudo_packet(handle, CMD_RETURN, sizeof(struct stat), NULL) );
 
 
     // (b) "send" individual field values into the buffer
@@ -1246,7 +1257,7 @@ void* server_thread(void* arg) {
   int rc = 0;
 
   // read client command
-  if (read_pseudo_packet_header(client_fd, hdr)) {
+  if (read_pseudo_packet_header(handle, hdr)) {
     neDBG("failed to read pseudo-packet header\n");
     pthread_exit(ctx);
   }
@@ -1261,7 +1272,7 @@ void* server_thread(void* arg) {
   // path into fname, and (b) update the header with the authorized cmd.
   //
   if (hdr->command == CMD_S3_AUTH) {
-     if ( server_s3_authenticate(ctx, client_fd, hdr, fname, FNAME_SIZE) ) {
+     if ( server_s3_authenticate(ctx, handle, hdr, fname, FNAME_SIZE) ) {
         ctx->flags |= CTX_THREAD_ERR;
         pthread_exit(ctx);
      }

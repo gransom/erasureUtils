@@ -93,7 +93,7 @@ GNU licenses can be found at http://www.gnu.org/licenses/.
 
 #else
 #  define neLOG(FMT,...)  fprintf(stdout,            FMT, ##__VA_ARGS__)
-#  define neERR(FMT,...)  fprintf(stderr,   FAIL_STR FMT, ##__VA_ARGS__)
+#  define neERR(FMT,...)  /* fprintf(stderr,   FAIL_STR FMT, ##__VA_ARGS__) */
 #  define neDBG(...)
 #endif
 
@@ -109,7 +109,8 @@ GNU licenses can be found at http://www.gnu.org/licenses/.
          PRINT(#EXPR " " #TEST "\n");                                   \
       }                                                                 \
       else {                                                            \
-         neLOG(FAIL_STR #EXPR " " #TEST "%s%s\n",                       \
+         /* neLOG(FAIL_STR #EXPR " " #TEST "%s%s\n", */                 \
+         PRINT(#EXPR " " #TEST "%s%s\n",                                \
              (errno ? ": " : ""),                                       \
              (errno ? strerror(errno) : ""));                           \
          RETURN;                                                        \
@@ -185,11 +186,11 @@ typedef void(*jHandlerType)(void* arg);
 #ifdef DEBUG_SOCKETS
 // #  define WR_TIMEOUT          10000
 // #  define RD_TIMEOUT          10000
-#  define WR_TIMEOUT          30
-#  define RD_TIMEOUT          30
+#  define WR_TIMEOUT             10
+#  define RD_TIMEOUT             10
 #else
-#  define WR_TIMEOUT             30
-#  define RD_TIMEOUT             30
+#  define WR_TIMEOUT             10
+#  define RD_TIMEOUT             10
 #endif
 
 
@@ -303,70 +304,11 @@ typedef struct sockaddr_in                   SockAddr;
 // shorthand, to turn thread-cancelability off/on
 // argument must be ENABLE or DISABLE
 #define THREAD_CANCEL(ENABLE)                                           \
-  do { int prev_cancel_state;                                           \
-    pthread_setcancelstate(PTHREAD_CANCEL_##ENABLE, &prev_cancel_state); \
-  } while (0)
+   do { int prev_cancel_state;                                          \
+      pthread_setcancelstate(PTHREAD_CANCEL_##ENABLE, &prev_cancel_state); \
+   } while (0)
 
 
-
-// Unused, for now
-typedef enum {
-  PROT_UNIX = 1,
-  PROT_IP,
-  PROT_IB,
-  PROT_IB_RDMA,                 // default
-} ProtoType;
-
-typedef struct {
-  ProtoType    prot;  // unused, for now
-  char         host[HOST_SIZE];
-  uint16_t     port;
-  char         port_str[PORT_STR_SIZE];
-  char         fname[FNAME_SIZE];
-} PathSpec;
-
-
-typedef enum {
-  HNDL_FNAME       = 0x0001,
-  HNDL_CONNECTED   = 0x0002,
-  HNDL_RIOMAPPED   = 0x0004,
-
-  HNDL_IS_SOCKET   = 0x0010,    // read/write-buffer also work on files
-  HNDL_RIOWRITE    = 0x0020,
-  HNDL_DOUBLE      = 0x0040,    // double-buffering (currently unused)
-
-  HNDL_GET         = 0x0100,
-  HNDL_PUT         = 0x0200,
-  HNDL_OP_INIT     = 0x0400,
-  HNDL_CLOSED      = 0x0800,
-
-  HNDL_SEEK_SET    = 0x1000,    // skt_write() found SEEK (see SocketHandle.seek_pos)
-  HNDL_PEER_EOF    = 0x2000,    // skt_write() found ACK 0
-  HNDL_SENT_DATA0  = 0x4000,    // skt_write() sent DATA0 (see copy_file_to_socket())
-  HNDL_FSYNC       = 0x8000,    // skt_read() found FSYNC
-} SHFlags;
-
-
-typedef enum {
-   SKT_F_SETAUTH   = 1          // install credentials on opened socket-handle
-} SocketFcntlCmd;
-
-
-
-// per-connection state
-typedef struct {
-  PathSpec           path_spec;   // host,port,path parsed from URL
-  int                open_flags;  // skt_open()
-  mode_t             open_mode;   // skt_open()
-  int                peer_fd;     // fd for comms with socket-peer
-  off_t              rio_offset;  // reader sends mapping to writer, for riowrite()
-  char*              rio_buf;     // reader saves riomapp'ed address, for riounmap()
-  size_t             rio_size;    // reader saves riomapp'ed size, for riounmap()
-  volatile size_t    stream_pos;  // ignore redundant skt_seek(), support reaper
-  ssize_t            seek_pos;    // ignore, unless HNDL_SEEK_ABS
-  uint16_t           flags;       // SHFlags
-  SktAuth            aws_ctx;     // S3_AUTH credentials (e.g. cached by DAL at init-time)
-} SocketHandle;
 
 
 
@@ -425,6 +367,78 @@ typedef struct {
   char        fname[FNAME_SIZE];
   uint32_t    mode;
 } OpenPacketHeader;
+
+
+
+
+
+
+
+
+// Unused, for now
+typedef enum {
+  PROT_UNIX = 1,
+  PROT_IP,
+  PROT_IB,
+  PROT_IB_RDMA,                 // default
+} ProtoType;
+
+typedef struct {
+  ProtoType    prot;  // unused, for now
+  char         host[HOST_SIZE];
+  uint16_t     port;
+  char         port_str[PORT_STR_SIZE];
+  char         fname[FNAME_SIZE];
+} PathSpec;
+
+
+typedef enum {
+  HNDL_FNAME       = 0x0001,
+  HNDL_CONNECTED   = 0x0002,
+  HNDL_RIOMAPPED   = 0x0004,
+
+  HNDL_IS_SOCKET   = 0x0010,    // read/write-buffer also work on files
+  HNDL_RIOWRITE    = 0x0020,
+  HNDL_DOUBLE      = 0x0040,    // double-buffering (currently unused)
+  HNDL_READ_AHEAD  = 0x0080,    // see unread_pseudo_packet_header()
+
+  HNDL_GET         = 0x0100,
+  HNDL_PUT         = 0x0200,
+  HNDL_OP_INIT     = 0x0400,
+  HNDL_CLOSED      = 0x0800,
+
+  HNDL_SEEK_SET    = 0x1000,    // skt_write() found SEEK (see SocketHandle.seek_pos)
+  HNDL_PEER_EOF    = 0x2000,    // skt_write() found ACK 0
+  HNDL_SENT_DATA0  = 0x4000,    // skt_write() sent DATA0 (see copy_file_to_socket())
+  HNDL_FSYNC       = 0x8000,    // skt_read() found FSYNC
+} SHFlags;
+
+
+typedef enum {
+   SKT_F_SETAUTH   = 1          // install credentials on opened socket-handle
+} SocketFcntlCmd;
+
+
+
+// per-connection state
+typedef struct {
+  PathSpec           path_spec;   // host,port,path parsed from URL
+  int                open_flags;  // skt_open()
+  mode_t             open_mode;   // skt_open()
+  int                peer_fd;     // fd for comms with socket-peer
+  off_t              rio_offset;  // reader sends mapping to writer, for riowrite()
+  char*              rio_buf;     // reader saves riomapp'ed address, for riounmap()
+  size_t             rio_size;    // reader saves riomapp'ed size, for riounmap()
+  volatile size_t    stream_pos;  // ignore redundant skt_seek(), support reaper
+  ssize_t            seek_pos;    // ignore, unless HNDL_SEEK_ABS
+  PseudoPacketHeader read_ahead;  // see unread_pseudo_packet_header()
+  SktAuth            aws_ctx;     // S3_AUTH credentials (e.g. cached by DAL at init-time)
+  uint16_t           flags;       // SHFlags
+} SocketHandle;
+
+
+
+
 
 
 
@@ -522,14 +536,17 @@ int ntoh_generic(char* dst, char* src, size_t src_size);
 
 
 // --- low-level tools
-int      write_pseudo_packet(int fd, SocketCommand command, size_t size, void* buff);
-int      read_pseudo_packet_header(int fd, PseudoPacketHeader* pkt);
+int      write_pseudo_packet(SocketHandle* handle, SocketCommand command, size_t size, void* buff);
+int      read_pseudo_packet_header(SocketHandle* handle, PseudoPacketHeader* pkt);
 
 int      read_init (SocketHandle* handle, SocketCommand cmd, char* buf, size_t size);
 int      write_init(SocketHandle* handle, SocketCommand cmd);
 
-ssize_t  read_buffer (int fd, char*       buf, size_t size, int is_socket);
-int      write_buffer(int fd, const char* buf, size_t size, int is_socket, off_t offset);
+ssize_t  read_buffer_from_file  (int fd,               char* buf, size_t size);
+ssize_t  read_buffer_from_socket(SocketHandle* handle, char* buf, size_t size);
+
+int      write_buffer_to_file  (int fd,               const char* buf, size_t size);
+int      write_buffer_to_socket(SocketHandle* handle, const char* buf, size_t size);
 
 ssize_t  copy_file_to_socket(int fd, SocketHandle* handle, char* buf, size_t size);
 ssize_t  copy_socket_to_file(SocketHandle* handle, int fd, char* buf, size_t size);
