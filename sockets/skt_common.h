@@ -351,24 +351,30 @@ typedef enum {
   PKT_ERR =   0x02,
 } PacketFlags;
 
-// These demarcate blobs of command-data on the socket-stream, and allow OOB commands.
+// These are blobs of control-data on the socket-stream, and allow OOB commands.
+// The buf can be reliably transmitted in a single send.
+// The sent buf contains a uint32_t, followed by a uint64_t, but they
+// are received such that the 64-bit int is aligned to a 64-bit boundary.
 typedef struct {
   uint8_t            flags;
-  SocketCommandType  command;   // SocketCommand
-  //  union {
-  //    uint64_t  big;
-  //    uint32_t  small[2];
-  //  } size;
-  int64_t            size;      /* sometimes holds signed return-code, etc */
+   union {
+      uint64_t       big[2];
+      uint32_t       small[4];  // 4th value is ignored (see HDR_BUFSIZE)
+   } buf;                       // (transmitted as a unit)
 } PseudoPacketHeader;
+
+#define HDR_SIZE(HDR)   (HDR)->buf.big[0]
+#define HDR_CMD(HDR)    (HDR)->buf.small[2]
+#define HDR_BUF(HDR)    &(HDR)->buf
+#define HDR_BUFSIZE     (sizeof(uint64_t) + sizeof(uint32_t))
+
+
 
 typedef struct {
   uint32_t    command;
   char        fname[FNAME_SIZE];
   uint32_t    mode;
 } OpenPacketHeader;
-
-
 
 
 
@@ -435,7 +441,6 @@ typedef struct {
   SktAuth            aws_ctx;     // S3_AUTH credentials (e.g. cached by DAL at init-time)
   uint16_t           flags;       // SHFlags
 } SocketHandle;
-
 
 
 
@@ -537,7 +542,7 @@ int ntoh_generic(char* dst, char* src, size_t src_size);
 
 // --- low-level tools
 int      write_pseudo_packet(SocketHandle* handle, SocketCommand command, size_t size, void* buff);
-int      read_pseudo_packet_header(SocketHandle* handle, PseudoPacketHeader* pkt);
+int      read_pseudo_packet_header(SocketHandle* handle, PseudoPacketHeader* hdr, int peek);
 
 int      read_init (SocketHandle* handle, SocketCommand cmd, char* buf, size_t size);
 int      write_init(SocketHandle* handle, SocketCommand cmd);
