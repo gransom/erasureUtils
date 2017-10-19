@@ -374,7 +374,9 @@ void *bq_writer(void *arg) {
   pthread_cleanup_push(bq_writer_finis, bq);
 
   // open the file.
+  mode_t mask = umask( 0000 );
   OPEN(bq->file, handle, bq->path, O_WRONLY|O_CREAT, 0666);
+  umask( mask );
 
   if(pthread_mutex_lock(&bq->qlock) != 0) {
     if (handle->stat_flags & SF_THREAD)
