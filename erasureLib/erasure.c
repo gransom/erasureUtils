@@ -146,6 +146,7 @@ extern void          ec_encode_data_base(int len, int srcs, int dests, unsigned 
 #endif
 
 int xattr_check( ne_handle handle, char *path );
+int manifest_check( SnprintfFunc fn, void* state, const uDAL* impl, SktAuth auth, char *path, ne_mode mode, ne_info status );
 static int gf_gen_decode_matrix(unsigned char *encode_matrix,
                                 unsigned char *decode_matrix,
                                 unsigned char *invert_matrix,
@@ -2513,6 +2514,447 @@ off_t ne_size( const char* path, int quorum, int max_stripe_width ) {
    return ne_size1(ne_default_snprintf, NULL, UDAL_POSIX, auth, 0, path, quorum, max_stripe_width);
 }
 
+
+/**
+ * Internal helper function intended to provide the acceptible number of matching values for manifest_check()
+ * @param ne_mode mode: The mode which manifest_check() is run under
+ * @param int N: The N (data) width of the stripe
+ * @param int E: The E (erasure) width of the stripe
+ * @return int: The acceptible number of matching values before manifest_check() can terminate
+ */
+int get_consensus( ne_mode mode, int N, int E ) {
+   E = ( E < 0 ) ? MAXE : E;
+   N = ( N < 0 ) ? MAXN : N;
+   if ( (N >= E)  &&  (E > 0) ) {
+      // for large N and small E, verifying E+1 is sufficient
+      return E+1;
+   }
+   else {
+      // if N < E, verify N+1; otherwise, verify N
+      return (E > 0) ? N+1 : N;
+   }
+}
+
+
+/**
+ * Internal helper function intended to access and verify erasure stripe manifest info
+ * @param 
+ * @param 
+ * @param 
+ * @param 
+ * @param char* path : Name structure for the files of the desired striping (should contain a single "%d" field)
+ * @param ne_mode mode : Mode flag indicating whether this is a read operation or a rebuild/verify (indicated by NE_WRONLY)
+ * @param ne_status status : Status struct to be populated with N/E/O/bsz/totsz and manifest error info
+ * @return int : Status code, with 0 indicating success and -1 indicating failure
+ */
+int manifest_check( SnprintfFunc fn, void* state, const uDAL* impl, SktAuth auth, char *path, ne_mode mode, ne_info status ) {
+#define DEFAULT_CONSENSUS 2
+   char xattrval[XATTRLEN];   /* char array for storing manifest strings */
+   char file[MAXNAME];        /* char array for storing path names */
+   char xattrN[5];            /* char array to get n parts from xattr */
+   char xattrerasure[5];      /* char array to get erasure parts from xattr */
+   char xattroffset[5];       /* char array to get erasure_offset from xattr */
+   char xattrchunksizek[20];  /* char array to get chunksize from xattr */
+   char xattrnsize[20];       /* char array to get total size from xattr */
+   char xattrncompsize[20];   /* char array to get ncompsz from xattr */
+   char xattrcsum[50];        /* char array to get check-sum from xattr */
+   char xattrtotsize[160];    /* char array to get totsz from xattr */
+   int N_list[ MAXPARTS ] = { -1 };
+   int E_list[ MAXPARTS ] = { -1 };
+   int O_list[ MAXPARTS ] = { -1 };
+   unsigned int bsz_list[ MAXPARTS ] = { 0 };
+   u64 totsz_list[ MAXPARTS ] = { 0 };
+   int N_match = 0;
+   int E_match = 0;
+   int O_match = 0;
+   int bsz_match = 0;
+   int totsz_match = 0;
+
+   char info_known = -1; //initialized at -1, set to 0 if temporary N/E are set, and set to 1 if N/E were passed in
+   int boundry;   //This is intended to stop manifest check running over files that we know don't exist
+   int consensus;
+   status->totsz = 0;
+   // check if N is already known
+   if ( status->N > 0 ) {
+      info_known = 1;
+      // Note: we now assume that N/E/O/bsz values provided in the status structure are valid
+      // Other values (nsz,ncompsz,totsz,etc.) are always assumed to be zero
+      boundry = status->N + status->E;
+      consensus = get_consensus( mode, status->N, status->E );
+      // TODO: if we have N/E/O already, it would be nice to start our check at the offset, in order to avoid overloading the first E+1 servers
+   }
+   else {
+      status->N = -1;
+      status->E = -1;
+      status->O = -1;
+      status->bsz = 0;
+      // if not, assume the maximum stripe width
+      boundry = MAXPARTS;
+      // super arbitrary initial limit for recalulating consensus
+      // see the note near the end of this function (starts with "This is a bit tricky") for more explanation.
+      consensus = DEFAULT_CONSENSUS;
+   }
+
+   // this is sort of an XNOR, hitting the error if mode is both or neither READ/WRITE
+   if ( (mode & NE_WRONLY  !=  0) == (mode & NE_RDONLY  !=  0) ) {
+      PRINTerr( "manifest_check: received an unexpected mode argument\n" );
+      return -1;
+   }
+
+   int minmatch=0;      //Indicates the smallest number of matches found amongst manifest values
+   int death_knell = 0; //Intended to allow early termination when dealing with very small N/E values
+   int counter;
+   int tmp_N = -1;
+   int tmp_E = -1;
+   int ret;
+   // loop until we have covered all possible files, or until all values have achieved a minimum consensus
+   for ( counter = 0; ( counter < boundry )  &&  ( (mode & NE_WRONLY)  ||  (minmatch < consensus) ); counter++ ) {
+      bzero(file, sizeof(file));
+      fn( file, sizeof(file), path, counter, state );
+      ret = ne_get_xattr1(impl, auth, file, xattrval, sizeof(xattrval));
+      if ( ret < 0 ) {
+         PRINTerr( "manifest_check: failure of manifest retrieval for file %s (%d)\n", file, counter );
+         status->manifest_status[counter] = 1;
+         death_knell++;
+         // if we are repeatedly failing to find manifests...
+         if ( death_knell > consensus ) {
+            if ( info_known == -1 ) {
+               if ( (tmp_N != -1)  ||  (tmp_E > 0) ) { // don't use N == -1 and E == 0, that would lock us into finding MAXN matching values!
+                  // if we have at least potential values for N or E, use them to calculate consensus
+                  consensus = get_consensus( mode, tmp_N, tmp_E );
+                  info_known = 0;
+                  PRINTdbg( "manifest_check: we have failed to find %d manifests in a row and are substituting potential N/E of %d/%d (new consensus = %d\n", death_knell, tmp_N, tmp_E, consensus );
+                  if ( consensus < DEFAULT_CONSENSUS ) { counter = 0; } //special case to restart the scan if the stripe is very narrow
+               }
+               // otherwise, just continue
+            }
+            else {
+               // if we have a good idea of N or E and have hit this many errors already, just give up
+               PRINTerr( "manifest_check: we have failed to locate %d manifests in a row while consensus = %d.  Giving up now!\n", death_knell, consensus );
+               return -1;
+            }
+         }
+         continue;
+      }
+      death_knell = 0;
+      PRINTdbg("manifest_check: file %s (%d) returned manifest \"%s\"\n", file, counter, xattrval );
+
+      ret = sscanf(xattrval,"%4s %4s %4s %19s %19s %19s %49s %159s",
+         xattrN,
+         xattrerasure,
+         xattroffset,
+         xattrchunksizek,
+         xattrnsize,
+         xattrncompsize,
+         xattrcsum,
+         xattrtotsize);
+      if (ret != 8) {
+         PRINTerr( "manifest_check: sscanf parsed only %d values from manifest of '%s'\n", ret, file);
+         status->manifest_status[counter] = 1;
+         continue;
+      }
+
+      // parse each value from the manifest, do a sanity check, and count the number of matching values amongst previous manifests
+      char* endptr;
+      N_list[ counter ] = (int)strtol(xattrN,&(endptr),10);
+      if ( *(endptr) != '\0'  ||  (N_list[ counter ] == -1) ) {
+         // specifically ignore reading in a -1 as we don't want all of the 'misread' filler values to be counted as matches
+         if ( N_list[ counter ] == -1 ) {
+            PRINTerr( "manifest_check: got unacceptable value of \'-1\' when parsing N for file %d\n", counter );
+         }
+         else {
+            PRINTerr( "manifest_check: strtol detected an invalid character (\'%c\') when parsing N for file %d\n", *(endptr), counter);
+            N_list[ counter ] = -1;
+         }
+         status->manifest_status[counter] = 1;
+         N_match = 0;
+      }
+      else if ( info_known != 1 ) {  //TODO: SHOULD PULL THIS OUT AS A MACRO!  REPEATED FOR VARIOUS TYPES BELOW
+         // set N_match to indicate the number of matches with the current value
+         if ( counter == 0  ||  N_list[ counter ] == N_list[ counter-1 ] ) {
+            N_match++;
+         }
+         else {
+            tmp_N = N_list[ counter ];
+            N_match = 1;
+            int tcnt;
+            for( tcnt = 0; tcnt < counter; tcnt++ ) {
+               if ( tmp_N == N_list[ tcnt ] )
+                  N_match++;
+            }
+         }
+      }
+      E_list[ counter ] = (int)strtol(xattrerasure,&(endptr),10);
+      if ( *(endptr) != '\0'  ||  (E_list[ counter ] == -1) ) {
+         if ( E_list[ counter ] == -1 ) {
+            PRINTerr( "manifest_check: got unacceptable value of \'-1\' when parsing E for file %d\n", counter );
+         }
+         else {
+            PRINTerr( "manifest_check: strtol detected an invalid character (\'%c\') when parsing E for file %d\n", *(endptr), counter);
+            E_list[ counter ] = -1;
+         }
+         status->manifest_status[counter] = 1;
+         E_match = 0;
+      }
+      else if ( info_known != 1 ) {
+         // set E_match to indicate the number of matches with the current value
+         if ( counter == 0  ||  E_list[ counter ] == E_list[ counter-1 ] ) {
+            E_match++;
+         }
+         else {
+            tmp_E = E_list[ counter ];
+            E_match = 1;
+            int tcnt;
+            for( tcnt = 0; tcnt < counter; tcnt++ ) {
+               if ( tmp_E == E_list[ tcnt ] )
+                  E_match++;
+            }
+         }
+      }
+      O_list[ counter ] = (int)strtol(xattroffset,&(endptr),10);
+      if ( *(endptr) != '\0'  ||  (O_list[ counter ] == -1) ) {
+         if ( O_list[ counter ] == -1 ) {
+            PRINTerr( "manifest_check: got unacceptable value of \'-1\' when parsing O for file %d\n", counter );
+         }
+         else {
+            PRINTerr( "manifest_check: strtol detected an invalid character (\'%c\') when parsing O for file %d\n", *(endptr), counter);
+            O_list[ counter ] = -1;
+         }
+         status->manifest_status[counter] = 1;
+         O_match = 0;
+      }
+      else if ( info_known != 1 ) {
+         // set O_match to indicate the number of matches with the current value
+         if ( counter == 0  ||  O_list[ counter ] == O_list[ counter-1 ] ) {
+            O_match++;
+         }
+         else {
+            O_match = 1;
+            int tcnt;
+            for( tcnt = 0; tcnt < counter; tcnt++ ) {
+               if ( O_list[ counter ] == O_list[ tcnt ] )
+                  O_match++;
+            }
+         }
+      }
+      bsz_list[ counter ] = (unsigned int)strtoul(xattrchunksizek,&(endptr),10);
+      if ( *(endptr) != '\0'  ||  (bsz_list[ counter ] == 0) ) {
+         if ( bsz_list[ counter ] == 0 ) {
+            PRINTerr( "manifest_check: got unacceptable value of \'0\' when parsing bsz for file %d\n", counter );
+         }
+         else {
+            PRINTerr( "manifest_check: strtol detected an invalid character (\'%c\') when parsing bsz for file %d\n", *(endptr), counter);
+            bsz_list[ counter ] = 0;
+         }
+         status->manifest_status[counter] = 1;
+         bsz_match = 0;
+      }
+      else if ( info_known != 1 ) {
+         // set bsz_match to indicate the number of matches with the current value
+         if ( counter == 0  ||  bsz_list[ counter ] == bsz_list[ counter-1 ] ) {
+            bsz_match++;
+         }
+         else {
+            bsz_match = 1;
+            int tcnt;
+            for( tcnt = 0; tcnt < counter; tcnt++ ) {
+               if ( bsz_list[ counter ] == bsz_list[ tcnt ] )
+                  bsz_match++;
+            }
+         }
+      }
+      status->nsz[ counter ] = strtoul(xattrnsize,&(endptr),10);
+      if ( *(endptr) != '\0' ) {
+         PRINTerr( "manifest_check: strtol detected an invalid character (\'%c\') when parsing nsz for file %d\n", *(endptr), counter);
+         status->manifest_status[counter] = 1;
+         status->nsz[ counter ] = 0;
+      }
+      status->ncompsz[ counter ] = strtoul(xattrncompsize,&(endptr),10);
+      if ( *(endptr) != '\0' ) {
+         PRINTerr( "manifest_check: strtol detected an invalid character (\'%c\') when parsing ncompsz for file %d\n", *(endptr), counter);
+         status->manifest_status[counter] = 1;
+         status->ncompsz[ counter ] = 0;
+      }
+      status->csum[ counter ] = strtoull(xattrcsum,&(endptr),10);
+      if ( *(endptr) != '\0' ) {
+         PRINTerr( "manifest_check: strtol detected an invalid character (\'%c\') when parsing csum for file %d\n", *(endptr), counter);
+         status->manifest_status[counter] = 1;
+         status->csum[ counter ] = 0;
+      }
+      totsz_list[ counter ] = strtoull(xattrtotsize,&(endptr),10);
+      if ( (*(endptr) != '\0')  ||  (totsz_list[ counter ] == 0) ) {
+         if ( totsz_list[ counter ] == 0 ) {
+            PRINTerr( "manifest_check: got unacceptable value of \'0\' when parsing totsz for file %d\n", counter );
+         }
+         else {
+            PRINTerr( "manifest_check: strtol detected an invalid character (\'%c\') when parsing totsz for file %d\n", *(endptr), counter);
+            totsz_list[ counter ] = 0;
+         }
+         status->manifest_status[counter] = 1;
+         totsz_match = 0;
+      }
+      else { //at least for now, we still need this for ne_read, even if we already have N/E/O
+         // set totsz_match to indicate the number of matches with the current value
+         if ( counter == 0  ||  totsz_list[ counter ] == totsz_list[ counter-1 ] ) {
+            totsz_match++;
+         }
+         else {
+            totsz_match = 1;
+            int tcnt;
+            for( tcnt = 0; tcnt < counter; tcnt++ ) {
+               if ( totsz_list[ counter ] == totsz_list[ tcnt ] )
+                  totsz_match++;
+            }
+         }
+      }
+
+      minmatch = MAXPARTS; //temporarily set this
+      int tmp_cnt;
+      if ( info_known == 1 ) {
+         // check for incorrect N/E/O/bsz values
+         if ( status->N != N_list[ counter ]  ||  status->E != E_list[ counter ]  ||  status->O != O_list[ counter ]  ||  status->bsz != bsz_list[ counter ] ) {
+            PRINTerr( "manifest_check: detected mismatch between file %d manifest (N/E/O/bsz = %d/%d/%d/%u) and expected values (N/E/O/bsz = %d/%d/%d/%u)\n", counter, N_list[ counter ], E_list[ counter ], O_list[ counter ], bsz_list[ counter ], status->N, status->E, status->O, status->bsz );
+            status->manifest_status[ counter ] = 1;
+         }
+      }
+      else {
+         // This is a bit tricky.  We need to be able to adapt to reading in correct N/E values and lowering the consensus limit appropriately.
+         // However, we don't want to hit a single bad manifest with very low values (N=1,E=0) and suddenly take it at its word (consensus = 1).
+         // Therefore, I've arbitrarily set consensus to a low  value that seemed at least reasonable (i.e. 2).  Once at least that many values 
+         // agree for N or E, we recalculate consensus.
+
+         if ( info_known == -1 ) {
+               // if we've been using a fake consensus value, correct it as soon as we have some level of certainty
+               if ( (N_match >= consensus)  ||  ((E_match >= consensus)  &&  (tmp_E != 0)) ) {
+                  // note that we don't want to call this when tmp_N==-1 and tmp_E==0
+                  // as that would lock us into finding MAXN matching values!
+                  consensus = get_consensus( mode, tmp_N, tmp_E );
+                  info_known = 0;
+                  PRINTdbg( "manifest_check: temporary consensus reached, using new consensus value of %d (file %d)\n", consensus, counter );
+               }
+               else {
+                  // if we still have no good idea of a true consensus, make sure not to set other values
+                  continue;
+               }
+         }
+
+         // update values of N/E, if necessary
+         char setNE = 0;
+         if ( status->N == -1 ) {
+            minmatch = N_match; //update minmatch
+            if ( N_match >= consensus ) {
+               status->N = N_list[ counter ];
+               if( N_match != counter+1 ) { //make sure all non-matching manifests are marked as wrong
+                  for ( tmp_cnt = 0; tmp_cnt < counter; tmp_cnt++ ) {
+                     if( N_list[tmp_cnt] != N_list[counter] ) { status->manifest_status[ tmp_cnt] = 1; }
+                  }
+               }
+               PRINTdbg( "manifest_check: consensus of %d achieved for N value %d from file %d\n", consensus, status->N, counter );
+               setNE = 1;
+            }
+         }
+         else if ( status->N != N_list[ counter ] ) { status->manifest_status[ counter ] = 1; }
+         if ( status->E == -1 ) {
+            if ( E_match < minmatch ) { minmatch = E_match; } //update minmatch
+            if ( E_match >= consensus ) {
+               status->E = E_list[ counter ];
+               if( E_match != counter+1 ) { //make sure all non-matching manifests are marked as wrong
+                  for ( tmp_cnt = 0; tmp_cnt < counter; tmp_cnt++ ) {
+                     if( E_list[tmp_cnt] != E_list[counter] ) { status->manifest_status[ tmp_cnt] = 1; }
+                  }
+               }
+               PRINTdbg( "manifest_check: consensus of %d achieved for E value %d from file %d\n", consensus, status->E, counter );
+               setNE = 1;
+            }
+         }
+         else if ( status->E != E_list[ counter ] ) { status->manifest_status[ counter ] = 1; }
+         if ( setNE ) {
+            // if either N or E changed, we need to update the consensus threshold and boundry
+            consensus = get_consensus( mode, status->N, status->E );
+            if ( status->N != -1  &&  status->E != -1 )
+               boundry = status->N + status->E;
+         }
+
+         // set Offset and Blk-Size, if not already set
+         if ( status->O == -1 ) {
+            if ( O_match < minmatch ) { minmatch = O_match; } //update minmatch
+            if ( O_match >= consensus ) {
+               status->O = O_list[ counter ];
+               if( O_match != counter+1 ) { //make sure all non-matching manifests are marked as wrong
+                  for ( tmp_cnt = 0; tmp_cnt < counter; tmp_cnt++ ) {
+                     if( O_list[tmp_cnt] != O_list[counter] ) { status->manifest_status[ tmp_cnt] = 1; }
+                  }
+               }
+               PRINTdbg( "manifest_check: consensus of %d achieved for O value %d from file %d\n", consensus, status->O, counter );
+            }
+         }
+         else if ( status->O != O_list[ counter ] ) { status->manifest_status[ counter ] = 1; }
+         if ( status->bsz == 0 ) {
+            if ( bsz_match < minmatch ) { minmatch = bsz_match; } //update minmatch
+            if ( bsz_match >= consensus ) {
+               status->bsz = bsz_list[ counter ];
+               if( bsz_match != counter+1 ) { //make sure all non-matching manifests are marked as wrong
+                  for ( tmp_cnt = 0; tmp_cnt < counter; tmp_cnt++ ) {
+                     if( bsz_list[tmp_cnt] != bsz_list[counter] ) { status->manifest_status[ tmp_cnt] = 1; }
+                  }
+               }
+               PRINTdbg( "manifest_check: consensus of %d achieved for bsz value %d from file %d\n", consensus, status->bsz, counter );
+            }
+         }
+         else if ( status->bsz != bsz_list[ counter ] ) { status->manifest_status[ counter ] = 1; }
+
+      }
+
+      // set totsz if not set and consensus achieved
+      if ( status->totsz == 0 ) {
+         if ( totsz_match < minmatch ) { minmatch = totsz_match; } //update minmatch
+         if ( totsz_match >= consensus ) {
+            status->totsz = totsz_list[ counter ];
+            if( totsz_match != counter+1 ) { //make sure all non-matching manifests are marked as wrong
+               for ( tmp_cnt = 0; tmp_cnt < counter; tmp_cnt++ ) {
+                  if( totsz_list[tmp_cnt] != totsz_list[counter] ) { status->manifest_status[ tmp_cnt] = 1; }
+               }
+            }
+            PRINTdbg( "manifest_check: consensus of %d achieved for totsz value %d from file %d\n", consensus, status->totsz, counter );
+         }
+      }
+      else if ( status->totsz != totsz_list[ counter ] ) { status->manifest_status[ counter ] = 1; }
+
+   } //END FOR-LOOP (reading manifests)
+
+   if ( minmatch < consensus ) { //if we failed to reach consensus, terminate
+      PRINTerr( "manifest_check: failed to achieve sufficient consensus amongst values (smalest-match=%d,consensus=%d)\n", minmatch, consensus );
+      return -1;
+   }
+
+   // perform some last-minute sanity checks on values
+   if ( info_known < 1 ) {
+      if ( status->N + status->E <= status->O ) {
+         PRINTerr( "manifest_check: N/E values of %d/%d are inconsistent with offset of %d\n", status->N, status->E, status->O );
+         return -1;
+      }
+   }
+   int valid_cnt = 0;
+   for( counter = 0; counter < status->N + status->E; counter++ ) {
+      if ( status->nsz[counter] % status->bsz != 0 ) {
+         PRINTerr( "manifest_check: bsz value of %u is inconsistent with nsz value of %lu from file %d\n", status->bsz, status->nsz[counter], counter );
+         status->manifest_status[counter] = 1;
+      }
+      if ( (status->nsz[counter] * status->N) - status->totsz >= (status->bsz * status->N) ) {
+         PRINTerr( "manifest_check: totsz/bsz/N of %llu/%u/%d are inconsistent with nsz of %lu from file %d\n", status->totsz, status->bsz, status->N, status->nsz[counter], counter );
+         status->manifest_status[counter] = 1;
+      }
+      if ( status->manifest_status[counter] != 1 ) { valid_cnt++; }
+   }
+
+   // after marking extra manifests as invalid, make sure we actually have a reasonable number of valid manifests before returning
+   if ( valid_cnt < consensus ) {
+      PRINTerr( "manifest_check: insufficient valid files detected (found %d valid, but need consensus of %d)\n", valid_cnt, consensus );
+      return -1;
+   }
+
+   return 0;
+}
 
 
 /**
