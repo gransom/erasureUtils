@@ -207,6 +207,8 @@ typedef struct ne_info_struct {
    unsigned int E;
    unsigned int O;
    unsigned int bsz;
+   uid_t owner;
+   gid_t group;
    u64 totsz;
    u64 csum[ MAXPARTS ];                      //offset agnostic
    unsigned long nsz[ MAXPARTS ];           //offset agnostic

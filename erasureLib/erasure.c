@@ -147,6 +147,7 @@ extern void          ec_encode_data_base(int len, int srcs, int dests, unsigned 
 
 int xattr_check( ne_handle handle, char *path );
 int manifest_check( SnprintfFunc fn, void* state, const uDAL* impl, SktAuth auth, char *path, ne_mode mode, ne_info status );
+int part_check( SnprintfFunc fn, void* state, const uDAL* impl, SktAuth auth, char *path, ne_info status );
 static int gf_gen_decode_matrix(unsigned char *encode_matrix,
                                 unsigned char *decode_matrix,
                                 unsigned char *invert_matrix,
@@ -2609,6 +2610,7 @@ int manifest_check( SnprintfFunc fn, void* state, const uDAL* impl, SktAuth auth
    int ret;
    // loop until we have covered all possible files, or until all values have achieved a minimum consensus
    for ( counter = 0; ( counter < boundry )  &&  ( (mode & NE_WRONLY)  ||  (minmatch < consensus) ); counter++ ) {
+      status->manifest_status[ counter ] = 0;  // initialize the status to 'good'
       bzero(file, sizeof(file));
       fn( file, sizeof(file), path, counter, state );
       ret = ne_get_xattr1(impl, auth, file, xattrval, sizeof(xattrval));
@@ -2628,7 +2630,7 @@ int manifest_check( SnprintfFunc fn, void* state, const uDAL* impl, SktAuth auth
                }
                // otherwise, just continue
             }
-            else {
+            else if ( mode & NE_RDONLY ) {
                // if we have a good idea of N or E and have hit this many errors already, just give up
                PRINTerr( "manifest_check: we have failed to locate %d manifests in a row while consensus = %d.  Giving up now!\n", death_knell, consensus );
                return -1;
@@ -2950,6 +2952,75 @@ int manifest_check( SnprintfFunc fn, void* state, const uDAL* impl, SktAuth auth
    // after marking extra manifests as invalid, make sure we actually have a reasonable number of valid manifests before returning
    if ( valid_cnt < consensus ) {
       PRINTerr( "manifest_check: insufficient valid files detected (found %d valid, but need consensus of %d)\n", valid_cnt, consensus );
+      return -1;
+   }
+
+   return 0;
+}
+
+
+/**
+ * Internal helper function intended to verify the existance/size of all data/erasure files associated with a libne stripe.
+ * @param
+ * @param
+ * @param
+ * @param
+ * @param char* path: Name structure for the files of the desired striping (should contain a single "%d" field)
+ * @param ne_info status: Pointer to the ne_info_structure intended to store the state of each file
+ * @return int: 0 on success and -1 on a failure
+ */
+int part_check( SnprintfFunc fn, void* state, const uDAL* impl, SktAuth auth, char *path, ne_info status ) {
+   char file[MAXNAME];       /* char array for names of files */
+   struct stat* partstat = malloc (sizeof(struct stat));
+
+   if( partstat == NULL ) {
+      PRINTerr( "part_check: failed to allocate memory for a stat struct\n" );
+      errno=ENOMEM;
+      return -1;
+   }
+
+   int faults = 0;
+   int counter;
+   for( counter = 0; counter < (status->N + status->E); counter++ ) {
+      // generate the appropriate file name
+      bzero(file,sizeof(file));
+      fn( file, MAXNAME, path, counter, state );
+
+      // stat each part-file, verifying existance
+      int ret = PATHOP(stat, impl, auth, file, partstat);
+      if( ret != 0 ) {
+         PRINTerr( "part_check: failed to locate \"%s\" (file %d)\n", file, counter );
+         status->data_status[ counter ] = 1;
+         faults++;
+         continue;
+      }
+      
+      status->owner = partstat->st_uid;
+      status->group = partstat->st_gid;
+
+      // If we ever do compression, this will need to be changed to compare against ncompsz
+#ifdef INT_CRC
+      int blocks = status->nsz[ counter ] / status->bsz;
+
+      if( ( status->nsz[ counter ] + (blocks*32) ) != partstat->st_size )
+#else
+      if( status->nsz[ counter ] != partstat->st_size )
+#endif
+      {
+         PRINTerr( "part_check: size of %zd for \"%s\" (file %d) is inconsistent with nsz %lu\n", partstat->st_size, file, counter, status->bsz );
+         status->data_status[ counter ] = 1;
+         faults++;
+         continue;
+      }
+
+      status->data_status[ counter ] = 0;
+   }
+
+   free( partstat );
+
+   // if too many errors were encountered, fail
+   if( faults > status->E ) {
+      PRINTerr( "part_check: failure -- %d part faults is beyond the erasure limit of %d\n", faults, status->E );
       return -1;
    }
 
