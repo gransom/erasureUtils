@@ -481,7 +481,7 @@ ssize_t   ne_write( ne_handle handle, const void *buffer, size_t nbytes );
 int       ne_close( ne_handle handle );
 int       ne_rebuild( ne_handle handle );
 int       ne_noxattr_rebuild( ne_handle handle );
-int       ne_flush( ne_handle handle );
+//int       ne_flush( ne_handle handle );
 
 #endif
 

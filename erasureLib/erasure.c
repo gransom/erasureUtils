@@ -3848,83 +3848,83 @@ int ne_rebuild( ne_handle handle ) {
  * @param ne_handle handle : Handle for the erasure striping to be flushed
  * @return int : 0 on success and -1 on failure
  */
-int ne_flush( ne_handle handle ) {
-   int N;
-   int E;
-   unsigned int bsz;
-   int ret = 0;
-   int tmp;
-//   int counter;
-//   int rem_back;
-   off_t pos[ MAXPARTS ];
-   unsigned char *zero_buff;
-
-   if ( handle == NULL ) {
-      PRINTerr( "ne_flush: received a NULL handle\n" );
-      errno = EINVAL;
-      return -1;
-   }
-
-   if ( handle->mode != NE_WRONLY ) {
-      PRINTerr( "ne_flush: handle is in improper mode for writing\n" );
-      errno = EINVAL;
-   }
-
-   N = handle->N;
-   E = handle->E;
-   bsz = handle->bsz;
-
-   if ( handle->buff_rem == 0 ) {
-      PRINTdbg( "ne_flush: handle buffer is empty, nothing to be done.\n" );
-      return ret;
-   }
-
-//   rem_back = handle->buff_rem;
+//int ne_flush( ne_handle handle ) {
+//   int N;
+//   int E;
+//   unsigned int bsz;
+//   int ret = 0;
+//   int tmp;
+////   int counter;
+////   int rem_back;
+//   off_t pos[ MAXPARTS ];
+//   unsigned char *zero_buff;
 //
-//   // store the seek positions for each file
-//   for ( counter = 0; counter < (handle->N + handle->E); counter++ ) {
-//      pos[counter] = HNDLOP(lseek, handle->FDArray[counter], 0, SEEK_CUR);
-//      if ( pos[counter] == -1 ) {
-//         PRINTerr( "ne_flush: failed to obtain current seek position for file %d\n", counter );
-//         return -1;
-//      }
-//      if ( (rem_back/(handle->bsz)) == counter ) {
-//         pos[counter] += rem_back % handle->bsz;
-//      }
-//      else if ( (rem_back/(handle->bsz)) > counter ) {
-//         pos[counter] += handle->bsz;
-//      }
-//      fprintf(stdout, "    got seek pos for file %d as %zd ( rem = %d )\n", counter, pos[counter], rem_back );//REMOVE
+//   if ( handle == NULL ) {
+//      PRINTerr( "ne_flush: received a NULL handle\n" );
+//      errno = EINVAL;
+//      return -1;
 //   }
-
-
-   PRINTdbg( "ne_flush: flusing handle buffer...\n" );
-   //zero the buffer to the end of the stripe
-   tmp = (N*bsz) - handle->buff_rem;
-   zero_buff = malloc(sizeof(char) * tmp);
-   bzero(zero_buff, tmp );
-
-   if ( tmp != ne_write( handle, zero_buff, tmp ) ) { //make ne_write do all the work
-      PRINTerr( "ne_flush: failed to flush handle buffer\n" );
-      ret = -1;
-   }
-
-//   // reset the seek positions for each file
-//   for ( counter = 0; counter < (handle->N + handle->E); counter++ ) {
-//      if ( HNDLOP(lseek, handle->FDArray[counter], pos[counter], SEEK_SET ) == -1 ) {
-//         PRINTerr( "ne_flush: failed to reset seek position for file %d\n", counter );
-//         return -1;
-//      }
-//      fprintf(stdout, "    set seek pos for file %d as %zd\n", counter, pos[counter] ); //REMOVE
+//
+//   if ( handle->mode != NE_WRONLY ) {
+//      PRINTerr( "ne_flush: handle is in improper mode for writing\n" );
+//      errno = EINVAL;
 //   }
-//   handle->buff_rem = rem_back;
-
-   //reset various handle properties
-   handle->totsz -= tmp;
-   free( zero_buff );
-
-   return ret;
-}
+//
+//   N = handle->N;
+//   E = handle->E;
+//   bsz = handle->bsz;
+//
+//   if ( handle->buff_rem == 0 ) {
+//      PRINTdbg( "ne_flush: handle buffer is empty, nothing to be done.\n" );
+//      return ret;
+//   }
+//
+////   rem_back = handle->buff_rem;
+////
+////   // store the seek positions for each file
+////   for ( counter = 0; counter < (handle->N + handle->E); counter++ ) {
+////      pos[counter] = HNDLOP(lseek, handle->FDArray[counter], 0, SEEK_CUR);
+////      if ( pos[counter] == -1 ) {
+////         PRINTerr( "ne_flush: failed to obtain current seek position for file %d\n", counter );
+////         return -1;
+////      }
+////      if ( (rem_back/(handle->bsz)) == counter ) {
+////         pos[counter] += rem_back % handle->bsz;
+////      }
+////      else if ( (rem_back/(handle->bsz)) > counter ) {
+////         pos[counter] += handle->bsz;
+////      }
+////      fprintf(stdout, "    got seek pos for file %d as %zd ( rem = %d )\n", counter, pos[counter], rem_back );//REMOVE
+////   }
+//
+//
+//   PRINTdbg( "ne_flush: flusing handle buffer...\n" );
+//   //zero the buffer to the end of the stripe
+//   tmp = (N*bsz) - handle->buff_rem;
+//   zero_buff = malloc(sizeof(char) * tmp);
+//   bzero(zero_buff, tmp );
+//
+//   if ( tmp != ne_write( handle, zero_buff, tmp ) ) { //make ne_write do all the work
+//      PRINTerr( "ne_flush: failed to flush handle buffer\n" );
+//      ret = -1;
+//   }
+//
+////   // reset the seek positions for each file
+////   for ( counter = 0; counter < (handle->N + handle->E); counter++ ) {
+////      if ( HNDLOP(lseek, handle->FDArray[counter], pos[counter], SEEK_SET ) == -1 ) {
+////         PRINTerr( "ne_flush: failed to reset seek position for file %d\n", counter );
+////         return -1;
+////      }
+////      fprintf(stdout, "    set seek pos for file %d as %zd\n", counter, pos[counter] ); //REMOVE
+////   }
+////   handle->buff_rem = rem_back;
+//
+//   //reset various handle properties
+//   handle->totsz -= tmp;
+//   free( zero_buff );
+//
+//   return ret;
+//}
 
 
 #ifndef HAVE_LIBISAL

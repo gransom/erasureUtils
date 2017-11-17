@@ -435,8 +435,8 @@ int main( int argc, const char* argv[] )
             toread = rand() % (totbytes+1);
       }
 
-      if ( ne_flush( handle ) != 0 ) {
-         PRINTerr("libneTest: flush failed!\n" );
+      if ( ne_close( handle ) != 0 ) {
+         PRINTerr("libneTest: ne_close failed!\n" );
          return -1;
       }
 
