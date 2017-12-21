@@ -435,14 +435,6 @@ int main( int argc, const char* argv[] )
             toread = rand() % (totbytes+1);
       }
 
-      if ( ne_close( handle ) != 0 ) {
-         PRINTerr("libneTest: ne_close failed!\n" );
-         return -1;
-      }
-
-      //      // if stat-flags were set, show collected stats
-      //      show_handle_stats(handle);
-
       free(buff);
       close(filefd);
       PRINTout("libneTest: all writes completed\n");
@@ -650,6 +642,7 @@ int main( int argc, const char* argv[] )
             nerr++;
          PRINTout( "%d ", stat->data_status[tmp] );
       }
+<<<<<<< HEAD
       PRINTout( "\n" );
 
       if( nerr > stat->E )
@@ -658,6 +651,11 @@ int main( int argc, const char* argv[] )
          fprintf( stderr, "WARNING: errors were found, be sure to rebuild this object before data loss occurs!\n" );
 
       free(stat);
+=======
+      printf( "\n" );
+      if( nerr > stat->E ) { fprintf( stderr, "WARNING: the data appears to be unrecoverable!\n" ); }
+      else if ( nerr > 0 ) { fprintf( stderr, "WARNING: errors were found, be sure to rebuild this object before data loss occurs!\n" ); }
+>>>>>>> emer_red_mod
 
       tmp=0;
       /* Encode any file errors into the return status */
@@ -666,6 +664,7 @@ int main( int argc, const char* argv[] )
             tmp += ( 1 << ((filefd + stat->start) % (stat->N+stat->E)) );
          }
       }
+      free(stat);
 
       printf("%d\n",tmp);
 

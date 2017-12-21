@@ -113,12 +113,11 @@ libne_a_SOURCES = erasure.c erasure.h udal.c udal.h
 libne_a_LIBADD = $(SOCKET_LIBS) $(TIMER_LIBS)
 
 
-bin_PROGRAMS = libneTest
+bin_PROGRAMS = libneTest data_shredder
 libneTest_SOURCES = libneTest.c
 libneTest_LDADD = libne.a $(SOCKET_LIBS) $(TIMER_LIBS)
-# libneTest_LDFLAGS = -lisal $(SOCKET_LD)
-
-
+libneTest_LDFLAGS = -lisal
+data_shredder_SOURCES = data_shredder.c
 
 check_PROGRAMS = test_read_offset testLink
 
