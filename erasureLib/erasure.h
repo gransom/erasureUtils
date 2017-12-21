@@ -167,7 +167,6 @@ typedef enum {
   NE_RDONLY = 0,
   NE_WRONLY,
   NE_REBUILD,
-  NE_STAT,
   NE_NOINFO = 4,
   NE_SETBSZ = 8
 } ne_mode;
@@ -202,7 +201,7 @@ typedef struct buffer_queue {
   size_t             buffer_size;
 } BufferQueue;
 
-typedef struct ne_info_struct {
+typedef struct ne_status_struct {
    unsigned int N;
    unsigned int E;
    unsigned int O;
@@ -211,23 +210,23 @@ typedef struct ne_info_struct {
    gid_t group;
    u64 totsz;
    u64 csum[ MAXPARTS ];                      //offset agnostic
-   unsigned long nsz[ MAXPARTS ];           //offset agnostic
+   unsigned long nsz[ MAXPARTS ];             //offset agnostic
    unsigned long ncompsz[ MAXPARTS ];         //offset agnostic
    unsigned char manifest_status[ MAXPARTS ]; //offset agnostic
    unsigned char data_status[ MAXPARTS ];     //offset agnostic
-} *ne_info;
-   
+} *ne_status;
+
 
 // REMOVE
-typedef struct ne_stat_struct {
-   char xattr_status[ MAXPARTS ];
-   char data_status[ MAXPARTS ];
-   int N;
-   int E;
-   int start;
-   unsigned int bsz;
-   u64 totsz;
-} *ne_stat;
+//typedef struct ne_stat_struct {
+//   char xattr_status[ MAXPARTS ];
+//   char data_status[ MAXPARTS ];
+//   int N;
+//   int E;
+//   int start;
+//   unsigned int bsz;
+//   u64 totsz;
+//} *ne_stat;
 
 
 // One of these for each channel.
@@ -285,78 +284,18 @@ int ne_default_snprintf(char* dest, size_t size, const char* format, u32 block, 
 struct FileSysImpl; // fwd-decl  (udal.h)
 struct GenericFD;   // fwd-decl  (udal.h)
 
-//struct handle {
-//   /* Erasure Info */
-//   ne_status status;
-//
-//   /* Read/Write Info and Structures */
-//   char *path;
-//   ne_mode mode; //maybe we want a void* in the handle, containing specific read/write info and structs
-//   void *buffer;
-//   unsigned char *buffs[ MAXPARTS ];
-//   unsigned long buff_rem;
-//   off_t buff_offset;
-//   GenericFD FDArray[ MAXPARTS ];
-//
-//   /* Threading fields */
-//   void *buffer_list[MAX_QDEPTH];
-//   void *block_buffs[MAX_QDEPTH][MAXPARTS];
-//   pthread_t threads[MAXPARTS];
-//   BufferQueue blocks[MAXPARTS];
-//
-//   /* Per-part Info */
-//   off_t written[ MAXPARTS ];
-//
-//   /* Error Pattern Info */
-//   int nerr;
-//   unsigned char src_in_err[ MAXPARTS ];   //offset dependent
-//   unsigned char src_err_list[ MAXPARTS ];
-//
-//   /* Erasure Manipulation Structures */
-//   unsigned char e_ready;
-//   unsigned char *encode_matrix;
-//   unsigned char *decode_matrix;
-//   unsigned char *invert_matrix;
-//   unsigned char *g_tbls;
-//   unsigned char *recov[ MAXPARTS ];
-//
-//   /* path-printing technique provided by caller */
-//   SnprintfFunc   snprintf;
-//   void*          state;        // caller-data to be provided to <snprintf>
-//
-//   /* pass-through to RDMA/sockets impl */
-//   SktAuth        auth;
-//
-//   /* run-time dispatch of sockets versus file implementation */
-//   const uDAL*    impl;
-//
-//   /* optional timing/benchmarking */
-//   int            stat_flags;        /* initialized at build-time */
-//   BenchStats     stats[ MAXPARTS ]; /* ops w/in each thread */
-//   BenchStats     agg_stats;         /* ops across "threads", O_RDONLY */
-//   FastTimer      handle_timer;      /* pre-open to post-close, all threads complete */
-//   FastTimer      erasure_timer;
-//   LogHisto       erasure_h;
-//};
-//typedef struct handle* ne_handle;
-
-
-// REMOVE
 struct handle {
    /* Erasure Info */
-   int N;
-   int E;
-   unsigned int bsz;
-   char *path;
+   ne_status status;
 
    /* Read/Write Info and Structures */
-   ne_mode mode;
-   u64 totsz;
+   char *path;
+   ne_mode mode; //maybe we want a void* in the handle, containing specific read/write info and structs
    void *buffer;
-   unsigned char *buffs[ MAXPARTS ];
    unsigned long buff_rem;
    off_t buff_offset;
-   GenericFD FDArray[ MAXPARTS ];
+   unsigned char *buffs[ MAXPARTS ];       //offset dependent
+   GenericFD FDArray[ MAXPARTS ];          //offset dependent
 
    /* Threading fields */
    void *buffer_list[MAX_QDEPTH];
@@ -365,28 +304,20 @@ struct handle {
    BufferQueue blocks[MAXPARTS];
 
    /* Per-part Info */
-   u64 csum[ MAXPARTS ];
-   unsigned long nsz[ MAXPARTS ];
-   unsigned long ncompsz[ MAXPARTS ];
-   off_t written[ MAXPARTS ];
+   off_t written[ MAXPARTS ];              //offset dependent
 
    /* Error Pattern Info */
    int nerr;
-   int erasure_offset;
-   unsigned char e_ready;
-   unsigned char src_in_err[ MAXPARTS ];
+   unsigned char src_in_err[ MAXPARTS ];   //offset dependent
    unsigned char src_err_list[ MAXPARTS ];
 
    /* Erasure Manipulation Structures */
+   unsigned char e_ready;
    unsigned char *encode_matrix;
    unsigned char *decode_matrix;
    unsigned char *invert_matrix;
    unsigned char *g_tbls;
    unsigned char *recov[ MAXPARTS ];
-
-   /* Used for rebuilds to restore the original ownership to the rebuilt file. */
-   uid_t owner;
-   gid_t group;
 
    /* path-printing technique provided by caller */
    SnprintfFunc   snprintf;
@@ -407,6 +338,74 @@ struct handle {
    LogHisto       erasure_h;
 };
 typedef struct handle* ne_handle;
+
+
+// REMOVE
+//struct handle {
+//   /* Erasure Info */
+//   int N;
+//   int E;
+//   unsigned int bsz;
+//   char *path;
+//
+//   /* Read/Write Info and Structures */
+//   ne_mode mode;
+//   u64 totsz;
+//   void *buffer;
+//   unsigned char *buffs[ MAXPARTS ];
+//   unsigned long buff_rem;
+//   off_t buff_offset;
+//   GenericFD FDArray[ MAXPARTS ];
+//
+//   /* Threading fields */
+//   void *buffer_list[MAX_QDEPTH];
+//   void *block_buffs[MAX_QDEPTH][MAXPARTS];
+//   pthread_t threads[MAXPARTS];
+//   BufferQueue blocks[MAXPARTS];
+//
+//   /* Per-part Info */
+//   u64 csum[ MAXPARTS ];
+//   unsigned long nsz[ MAXPARTS ];
+//   unsigned long ncompsz[ MAXPARTS ];
+//   off_t written[ MAXPARTS ];
+//
+//   /* Error Pattern Info */
+//   int nerr;
+//   int erasure_offset;
+//   unsigned char e_ready;
+//   unsigned char src_in_err[ MAXPARTS ];
+//   unsigned char src_err_list[ MAXPARTS ];
+//
+//   /* Erasure Manipulation Structures */
+//   unsigned char *encode_matrix;
+//   unsigned char *decode_matrix;
+//   unsigned char *invert_matrix;
+//   unsigned char *g_tbls;
+//   unsigned char *recov[ MAXPARTS ];
+//
+//   /* Used for rebuilds to restore the original ownership to the rebuilt file. */
+//   uid_t owner;
+//   gid_t group;
+//
+//   /* path-printing technique provided by caller */
+//   SnprintfFunc   snprintf;
+//   void*          state;        // caller-data to be provided to <snprintf>
+//
+//   /* pass-through to RDMA/sockets impl */
+//   SktAuth        auth;
+//
+//   /* run-time dispatch of sockets versus file implementation */
+//   const uDAL*    impl;
+//
+//   /* optional timing/benchmarking */
+//   int            stat_flags;        /* initialized at build-time */
+//   BenchStats     stats[ MAXPARTS ]; /* ops w/in each thread */
+//   BenchStats     agg_stats;         /* ops across "threads", O_RDONLY */
+//   FastTimer      handle_timer;      /* pre-open to post-close, all threads complete */
+//   FastTimer      erasure_timer;
+//   LogHisto       erasure_h;
+//};
+//typedef struct handle* ne_handle;
 
 
 
