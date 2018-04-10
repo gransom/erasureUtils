@@ -120,13 +120,13 @@ include_HEADERS = erasure.h ne_logging.h udal.h
 
 lib_LIBRARIES = libne.a
 libne_a_SOURCES = erasure.c erasure.h udal.c udal.h
-libne_a_LIBADD = $(SOCKET_LIBS) $(TIMER_LIBS)
+libne_a_LIBADD = $(SOCKET_LIBS) $(TIMER_LIBS) 
 
 
 bin_PROGRAMS = libneTest
 libneTest_SOURCES = libneTest.c
 libneTest_LDADD = libne.a $(SOCKET_LIBS) $(TIMER_LIBS)
-# libneTest_LDFLAGS = -lisal $(SOCKET_LD)
+libneTest_LDFLAGS = -lm
 
 
 

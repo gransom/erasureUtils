@@ -91,8 +91,8 @@ GNU licenses can be found at http://www.gnu.org/licenses/.
 #  define ft_unlikely(x)    (x)
 #endif
 
-
-
+#define DEFAULT_ARRAY_SIZE 32
+#define ARRAY_SIZE_MULTIPLIER 2
 // HI/LO are indices for TimerValue.v32[] elements,
 // such that TimerValue.v64 can be used without further manipulation.
 #include <endian.h>
@@ -217,9 +217,10 @@ int fast_timer_stop(FastTimer* ft) {
 
    // printf("stop: %llx = %08lx %08lx\n", stop.v64, stop.v32[HI], stop.v32[LO]);
    ft->accum += ft->stop.v64 - ft->start.v64;
-   return 0;
+   //return 0;
+   //try something new, lets return the interval the read took in terms of ticks
+   return ft->stop.v64 - ft->start.v64;
 }
-
 
 
 // stop previous interval, and begin a new one
@@ -271,13 +272,14 @@ int fast_timer_stop_start(FastTimer* ft) {
 double fast_timer_sec(FastTimer* ft);
 double fast_timer_usec(FastTimer* ft);
 double fast_timer_nsec(FastTimer* ft);
-
+double fast_timer_sec_v2(uint64_t time);
 
 // print timer stats
 int fast_timer_show(FastTimer* ft, int simple, const char* str);
 int fast_timer_show_details(FastTimer* ft, const char* str);
 
-
+//write histograms to message buffer
+int writeHisto(uint16_t* bin, int simple, int podID, int blk, char* message, int type);
 
 
 // ---------------------------------------------------------------------------
@@ -410,7 +412,25 @@ int log_histo_add_interval(LogHisto* hist, FastTimer* ft) {
    return log_histo_add_value(hist, (ft->stop.v64 - ft->start.v64));
 }
 
+static __attribute__((always_inline)) inline
+int log_histo_add_value_v1(uint16_t* hist, uint64_t timer_value)
+{
+	int i;
+	uint64_t bit = (uint64_t)1 << 63;
+	for (i=64; i; --i)
+	{
+		if (timer_value & bit)
+			break;
+		bit >>= 1;
+	}
+	hist[i] += 1;
+}
 
+static __attribute__((always_inline)) inline
+int log_histo_add_interval_v1(uint16_t* hist, FastTimer* ft)
+{
+	return log_histo_add_value_v1(hist, (ft->stop.v64 - ft->start.v64));
+}
 
 // increment the bin corresponding to ft->accum.
 // (e.g. if multiple intervals were required to accumulate the quantity to be binned)
@@ -435,7 +455,7 @@ int log_histo_add(LogHisto* dest, LogHisto* src) {
 
 
 int log_histo_show(LogHisto* hist, int simple, const char* str);
-
+int log_histo_show_v2(uint16_t* bin, int simple, const char* str);
 
 
 #endif

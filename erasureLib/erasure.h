@@ -70,7 +70,7 @@ GNU licenses can be found at http://www.gnu.org/licenses/.
 #include <stdint.h>
 #include <sys/types.h>
 #include <pthread.h>
-
+#include <math.h>
 
 #define NE_LOG_PREFIX "libne"
 
@@ -217,6 +217,7 @@ typedef struct buffer_queue {
   size_t             buffer_size;
 } BufferQueue;
 
+
 typedef struct ne_stat_struct {
    char xattr_status[ MAXPARTS ];
    char data_status[ MAXPARTS ];
@@ -234,7 +235,10 @@ typedef struct ne_stat_struct {
 #include "fast_timer.h"
 typedef struct {
    FastTimer   thread;
+   LogHisto    thread_h;
+
    FastTimer   open;
+   LogHisto    open_h;
 
    FastTimer   read;
    LogHisto    read_h;
@@ -243,6 +247,7 @@ typedef struct {
    LogHisto    write_h;
 
    FastTimer   close;
+   LogHisto    close_h;
 
    FastTimer   rename;
    FastTimer   stat;
@@ -352,6 +357,13 @@ struct handle {
    FastTimer      handle_timer;      /* pre-open to post-close, all threads complete */
    FastTimer      erasure_timer;
    LogHisto       erasure_h;
+
+   int blkToPod[MAXPARTS];
+   int num_pods;
+   int* copyCnt;
+   double* totalHandleTime;
+   double* totalErasureTime;
+   uint16_t* histos;
 };
 typedef struct handle* ne_handle;
 

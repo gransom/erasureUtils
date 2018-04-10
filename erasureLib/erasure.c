@@ -368,13 +368,31 @@ void bq_writer_finis(void* arg) {
   PRINTdbg("exiting thread for block %d, in %s\n", bq->block_number, bq->path);
 }
 
+int getPodNum(char* path)
+{
+        char* podPtr = strstr(path, "pod");
+        char* slashPtr = strchr(podPtr, '/');
+        unsigned int diff = slashPtr - podPtr;
+        int i;
+        int podNum = 0;
+        podPtr += 3;
+        for(i = diff; i > 0; i--)
+        {
+               int dig = podPtr[0] - '0';
+               podNum += ((int)pow((double)10, (double)(diff - 1))) * dig;
+        }
+
+	return podNum;
+}
+
 
 void *bq_writer(void *arg) {
   BufferQueue *bq      = (BufferQueue *)arg;
   ne_handle    handle  = bq->handle;
   size_t       written = 0;
   int          error;
-
+  int podNum;
+  //printf("******erasure file path %s\n", bq->path);
 #ifdef INT_CRC
   const int write_size = bq->buffer_size + sizeof(u32);
 #else
@@ -392,10 +410,10 @@ void *bq_writer(void *arg) {
 
   // open the file.
   OPEN(bq->file, handle, bq->path, O_WRONLY|O_CREAT, 0666);
-
   if(pthread_mutex_lock(&bq->qlock) != 0) {
     if (handle->timing_flags & TF_THREAD)
        fast_timer_stop(&handle->stats[bq->block_number].thread);
+       log_histo_add_interval(&handle->stats[bq->block_number].thread_h, &handle->stats[bq->block_number].thread);
     exit(-1); // XXX: is this the appropriate response??
   }
   if(FD_ERR(bq->file)) {
@@ -410,6 +428,7 @@ void *bq_writer(void *arg) {
   PRINTdbg("opened file %d\n", bq->block_number);
   if (handle->timing_flags & TF_OPEN)
      fast_timer_stop(&handle->stats[bq->block_number].open);
+     log_histo_add_interval(&handle->stats[bq->block_number].open_h, &handle->stats[bq->block_number].open);
   if (handle->timing_flags & TF_RW)
      fast_timer_start(&handle->stats[bq->block_number].read);
 
@@ -422,6 +441,7 @@ void *bq_writer(void *arg) {
       // XXX: This is a FATAL error
       if (handle->timing_flags & TF_THREAD)
          fast_timer_stop(&handle->stats[bq->block_number].thread);
+         log_histo_add_interval(&handle->stats[bq->block_number].thread_h, &handle->stats[bq->block_number].thread);
       return (void *)-1;
     }
     while(bq->qdepth == 0 && !((bq->flags & BQ_FINISHED) || (bq->flags & BQ_ABORT))) {
@@ -448,6 +468,7 @@ void *bq_writer(void *arg) {
 
       if (handle->timing_flags & TF_CLOSE)
          fast_timer_stop(&handle->stats[bq->block_number].close);
+	 log_histo_add_interval(&handle->stats[bq->block_number].close_h, &handle->stats[bq->block_number].close);
       return NULL;
     }
 
@@ -485,7 +506,7 @@ void *bq_writer(void *arg) {
 
       PRINTdbg("write done for block %d\n", bq->block_number);
       if (handle->timing_flags & TF_RW) {
-         fast_timer_stop(&handle->stats[bq->block_number].write);
+	 fast_timer_stop(&handle->stats[bq->block_number].write);
          log_histo_add_interval(&handle->stats[bq->block_number].write_h,
                                 &handle->stats[bq->block_number].write);
       }
@@ -526,6 +547,7 @@ void *bq_writer(void *arg) {
     PRINTerr("error closing block %d\n", bq->block_number);
     if (handle->timing_flags & TF_THREAD)
        fast_timer_stop(&handle->stats[bq->block_number].thread);
+       log_histo_add_interval(&handle->stats[bq->block_number].thread_h, &handle->stats[bq->block_number].thread);
     return NULL; // don't bother trying to rename
   }
 
@@ -536,11 +558,12 @@ void *bq_writer(void *arg) {
     PRINTerr("error setting xattr for block %d\n", bq->block_number);
     if (handle->timing_flags & TF_THREAD)
        fast_timer_stop(&handle->stats[bq->block_number].thread);
+       log_histo_add_interval(&handle->stats[bq->block_number].thread_h, &handle->stats[bq->block_number].thread);
     return NULL;
   }
   if (handle->timing_flags & TF_CLOSE)
      fast_timer_stop(&handle->stats[bq->block_number].close);
-
+     log_histo_add_interval(&handle->stats[bq->block_number].close_h, &handle->stats[bq->block_number].close);
 
   // rename
   if (handle->timing_flags & TF_RENAME)
@@ -571,7 +594,7 @@ void *bq_writer(void *arg) {
      fast_timer_stop(&handle->stats[bq->block_number].rename);
   if (handle->timing_flags & TF_THREAD)
      fast_timer_stop(&handle->stats[bq->block_number].thread);
-
+     log_histo_add_interval(&handle->stats[bq->block_number].thread_h, &handle->stats[bq->block_number].thread);
   pthread_cleanup_pop(1);
   return NULL;
 }
@@ -584,7 +607,7 @@ void *bq_writer(void *arg) {
 static int initialize_queues(ne_handle handle) {
   int i;
   int num_blocks = handle->N + handle->E;
-
+  int podNum;
   /* allocate buffers */
   for(i = 0; i < MAX_QDEPTH; i++) {
     int error = posix_memalign(&handle->buffer_list[i], 64,
@@ -609,9 +632,9 @@ static int initialize_queues(ne_handle handle) {
     // generate the path
     // sprintf(bq->path, handle->path, (i + handle->erasure_offset) % num_blocks);
     handle->snprintf(bq->path, MAXNAME, handle->path, (i + handle->erasure_offset) % num_blocks, handle->state);
-
     strcat(bq->path, WRITE_SFX);
-
+    podNum = getPodNum(handle->path);
+    handle->blkToPod[i] = podNum;
     // assign pointers into the memaligned buffers.
     void *buffers[MAX_QDEPTH];
     int j;
@@ -968,15 +991,16 @@ ne_handle ne_open1_vl( SnprintfFunc fn, void* state,
      counter = 0;
      PRINTdbg( "opening file descriptors...\n" );
      mode_t mask = umask(0000);
+     int podNum;
      while ( counter < N+E ) {
-
-       if (handle->timing_flags & TF_OPEN)
+       //if (handle->timing_flags & TF_OPEN)
            fast_timer_start(&handle->stats[counter].open);
 
        bzero( file, MAXNAME );
        u32 blk_i = (counter+erasure_offset)%(N+E); // absolute index of block to be written, within pod
        handle->snprintf(file, MAXNAME, path, blk_i, handle->state);
-       
+       podNum = getPodNum(path);
+       handle->blkToPod[counter] = podNum;     
 #ifdef INT_CRC
        if ( counter > N ) {
          crccount = counter - N;
@@ -989,27 +1013,34 @@ ne_handle ne_open1_vl( SnprintfFunc fn, void* state,
        handle->buffs[counter] = handle->buffer + ( counter*bsz ); //make space for block
 #endif
 
-       if (handle->timing_flags & TF_OPEN)
-          fast_timer_start(&handle->stats[counter].open);
 
       if( mode == NE_WRONLY ) {
          PRINTdbg( "   opening %s%s for write\n", file, WRITE_SFX );
+	 printf( "   opening %s%s for write\n", file, WRITE_SFX );
          OPEN(handle->FDArray[counter], handle,
               strncat( file, WRITE_SFX, strlen(WRITE_SFX)+1 ), O_WRONLY | O_CREAT, 0666 );
       }
       else if ( mode == NE_REBUILD  &&  handle->src_in_err[counter] == 1 ) {
          PRINTdbg( "   opening %s%s for write\n", file, REBUILD_SFX );
+	 printf( "   opening %s%s for write\n", file, REBUILD_SFX );
          OPEN(handle->FDArray[counter], handle,
               strncat( file, REBUILD_SFX, strlen(REBUILD_SFX)+1 ), O_WRONLY | O_CREAT, 0666 );
       }
       else {
          PRINTdbg( "   opening %s for read\n", file );
+	 printf( "   opening %s for read\n", file );
          OPEN(handle->FDArray[counter], handle, file, O_RDONLY );
       }
-
-      if (handle->timing_flags & TF_OPEN)
-         fast_timer_stop(&handle->stats[counter].open);
-
+	printf("### open file name %s\n", file);
+      //if (handle->timing_flags & TF_OPEN)
+      //{
+	fast_timer_stop(&handle->stats[counter].open);
+         //uint64_t openTicks = fast_timer_stop(&handle->stats[counter].open);
+	 //double openSecs = fast_timer_sec_v2(openTicks);
+	 //printf("block %d open time %7.5f\n", counter, openSecs);
+         log_histo_add_interval(&handle->stats[counter].open_h,
+                                &handle->stats[counter].open);
+      //}
       if ( FD_ERR(handle->FDArray[counter])  &&  handle->src_in_err[counter] == 0 ) {
          PRINTerr( "   failed to open file %s!!!!\n", file );
          handle->src_err_list[handle->nerr] = counter;
@@ -2080,7 +2111,7 @@ int show_handle_stats(ne_handle handle) {
 
          fast_timer_show(&handle->stats[i].thread, simple, "thread:  ");
          fast_timer_show(&handle->stats[i].open,   simple, "open:    ");
-
+	 log_histo_show(&handle->stats[i].open_h, 1,  "open_h:  ");
          fast_timer_show(&handle->stats[i].read,   simple, "read:    ");
          log_histo_show(&handle->stats[i].read_h,  simple, "read_h:  ");
 
@@ -2088,6 +2119,7 @@ int show_handle_stats(ne_handle handle) {
          log_histo_show(&handle->stats[i].write_h, simple, "write_h: ");
 
          fast_timer_show(&handle->stats[i].close,  simple, "close:   ");
+	 log_histo_show(&handle->stats[i].close_h, simple, "close_h: ");
          fast_timer_show(&handle->stats[i].rename, simple, "rename:  ");
          fast_timer_show(&handle->stats[i].stat,   simple, "stat:    ");
          fast_timer_show(&handle->stats[i].xattr,  simple, "xattr:   ");
@@ -2098,6 +2130,42 @@ int show_handle_stats(ne_handle handle) {
    }
 
    return 0;
+}
+
+static void copy_timing_stats(ne_handle handle)
+{
+	int i;
+	int j;
+	int totalBlks = handle->N + handle->E;
+	int num_pods = handle->num_pods;
+	uint16_t* openCursor;
+	uint16_t* closeCursor;
+	uint16_t* readCursor;
+	uint16_t* writeCursor;
+	uint16_t* threadCursor;
+	int podNum;
+
+	*(handle->totalHandleTime) = fast_timer_sec(&handle->handle_timer);
+	*(handle->totalErasureTime) = fast_timer_sec(&handle->erasure_timer);
+	for(i = 0; i < totalBlks; i++)
+	{
+		podNum = handle->blkToPod[i];
+		openCursor = handle->histos + podNum * MAXPARTS * 65 * 5;
+		closeCursor = handle->histos + podNum * MAXPARTS * 65 * 5 + MAXPARTS * 65;
+		readCursor = handle->histos + podNum * MAXPARTS * 65 * 5 + MAXPARTS * 65 * 2;
+		writeCursor = handle->histos + podNum * MAXPARTS * 65 * 5 + MAXPARTS * 65 * 3;
+		threadCursor = handle->histos + podNum * MAXPARTS * 65 * 5 + MAXPARTS * 65 * 4;
+		for(j = 0; j < 65; j++)
+		{
+			openCursor[i * 65 + j] += handle->stats[i].open_h.bin[j];
+			closeCursor[i * 65 + j] += handle->stats[i].close_h.bin[j];
+			readCursor[i * 65 + j] += handle->stats[i].read_h.bin[j];
+			writeCursor[i * 65 + j] += handle->stats[i].write_h.bin[j];
+			threadCursor[i * 65 + j] += handle->stats[i].thread_h.bin[j];
+		}
+	}
+
+	*handle->copyCnt = *handle->copyCnt + 1;
 }
 
 /**
@@ -2131,6 +2199,7 @@ int ne_close( ne_handle handle )
    unsigned int bsz;
    int ret = 0;
    int tmp;
+   int podNum;
    unsigned char *zero_buff;
 
 
@@ -2165,7 +2234,7 @@ int ne_close( ne_handle handle )
    /* Close file descriptors and free bufs and set xattrs for written files */
    counter = 0;
    while (counter < N+E) {
-
+     fast_timer_start(&handle->stats[counter].close);
      if (handle->mode == NE_REBUILD && handle->src_in_err[counter] == 1 ) {
          // if mode is NE_WRONLY this will be handled by the BQ thread.
          if(set_block_xattr(handle, counter) != 0) {
@@ -2238,7 +2307,9 @@ int ne_close( ne_handle handle )
             handle->nerr++;
          }
       }
-
+      fast_timer_stop(&handle->stats[counter].close);
+      log_histo_add_interval(&handle->stats[counter].close_h,
+                             &handle->stats[counter].close);
       counter++;
    }
 
@@ -2267,7 +2338,7 @@ int ne_close( ne_handle handle )
 
    if (handle->timing_flags) {
       fast_timer_stop(&handle->handle_timer);
-      show_handle_stats(handle);
+      //show_handle_stats(handle);
    }
 
    if( (UNSAFE(handle) && handle->mode == NE_WRONLY) || (handle->nerr > handle->E) /* for non-writes */) {
@@ -2294,7 +2365,14 @@ int ne_close( ne_handle handle )
    
    if (handle->timing_flags & TF_HANDLE)
       fast_timer_stop(&handle->handle_timer); /* overall cost of this op */
-
+   
+   if (handle->totalHandleTime != NULL)
+   {
+	copy_timing_stats(handle);
+   } 
+   
+   //printf("****LIBNED CALLING SHOW HANDLE STATS\n");
+   //show_handle_stats(handle);
    free(handle);
    return ret;
 }

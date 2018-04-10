@@ -207,7 +207,10 @@ double fast_timer_nsec(FastTimer* ft) {
    return ((double)ft->accum / ticks_per_sec) * G;
 }
 
-
+double fast_timer_sec_v2(uint64_t time)
+{
+	return ((double)time / ticks_per_sec);
+}
 
 int fast_timer_show(FastTimer* ft, int simple, const char* str) {
    const char* str1 = ((str) ? str : "");
@@ -318,3 +321,82 @@ int log_histo_show(LogHisto* hist, int simple, const char* str) {
    if (! simple)
       printf("\n");
 }
+
+int log_histo_show_v2(uint16_t* bin, int simple, const char* str)
+{
+	
+	int i;
+
+	printf("%s:", str);
+	if(!simple)
+	{
+		printf("\n\t");
+	}
+	for (i = 0; i < 65; i++)
+	{
+           if (i && !(i%4))
+             printf("  ");
+           if ((i && !(i%16)) && (! simple))
+             printf("\n\t");
+
+           if ((bin[64 - i]) || simple)
+             printf("%2d ", bin[64 - i]);
+           else
+             printf("-- ");
+	}
+	printf("\n");
+	if (! simple)
+		printf("\n");
+}
+
+int writeHisto(uint16_t* bin, int simple, int podID, int blk, char* message, int type)
+{
+	int i;
+	int wBytes = 0;
+	//first write blk number 
+	switch(type)
+	{
+		case 0:
+			wBytes += snprintf(message, 64, "pod %d blk %d open    :", podID, blk);
+			break;
+		case 1:
+			wBytes += snprintf(message, 64, "pod %d blk %d close   :", podID, blk);
+			break;
+		case 2:
+			wBytes += snprintf(message, 64, "pod %d blk %d read    :", podID, blk);
+			break;
+		case 3:
+			wBytes += snprintf(message, 64, "pod %d blk %d write   :", podID, blk);
+			break;
+		case 4:
+			wBytes += snprintf(message, 64, "pod %d blk %d thread  :", podID, blk);
+			break;
+		default:
+			printf("invalid val %d\n", type);
+			return;
+	}
+	//wBytes += snprintf(message, 32, "blk %d:", blk);
+	
+	if(!simple)
+	{
+		wBytes += snprintf(message+wBytes, 4, "\n\t");
+	}
+
+	for (i = 0; i < 65; i++)
+	{
+		if (i && !(i%4))
+		 wBytes += snprintf(message+wBytes, 8, "  ");
+		if ((i && !(i%16)) && (! simple))
+		 wBytes += snprintf(message+wBytes, 4, "\n\t");
+		if ((bin[64 - i]) || simple)
+		 wBytes += snprintf(message+wBytes, 64, "%2d ", bin[64-i]);
+		else
+		 wBytes += snprintf(message+wBytes, 8, "-- ");
+	}
+	wBytes += snprintf(message+wBytes, 4, "\n");
+	if (!simple)
+	 wBytes +=snprintf(message+wBytes, 4, "\n");
+
+	return wBytes;
+}
+
