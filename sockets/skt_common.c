@@ -64,6 +64,7 @@ GNU licenses can be found at http://www.gnu.org/licenses/.
 #include <sys/select.h>
 
 #include "skt_common.h"
+#include "fast_timer.h"
 
 
 // ...........................................................................
@@ -139,7 +140,7 @@ shut_down_handle(SocketHandle* handle) {
     SETSOCKOPT(handle->peer_fd, SOL_SOCKET, SO_RCVTIMEO, (const void*)&tv, sizeof(tv));
     SETSOCKOPT(handle->peer_fd, SOL_SOCKET, SO_SNDTIMEO, (const void*)&tv, sizeof(tv));
 
-#if 0
+#if 1
     // NOTE: As of librdmacm-1.0.21 (installed in our TOSS-2 RHEL6.9
     //       machines) rclose() calls rshutdown(), if needed.
     //       
@@ -158,6 +159,19 @@ shut_down_handle(SocketHandle* handle) {
     //    0x00000000004046da in server_thread (arg=0x60f5e8) at marfs_objd.c:748
     //    0x00002b9eb5452aa1 in start_thread (arg=0x2b9eb718a700) at pthread_create.c:301
     //    0x00002b9eb596593d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:115
+    //
+    // UPDATE 2018-02-20:
+    //
+    // I'd bet that the deadlocking mentioned above was happening before we
+    // patched rdma-core.  If so, then rshutdown() should "just work", in
+    // implementations that include rdma-core after ~2017-09.  Meanwhile,
+    // for running on RHEL6 we use BUG_LOCK() to implement a work-around,
+    // which imposes locking around opens and closes.  I don't think we're
+    // seeing deadlocks in rshutdown(), but rclose() -> rshutdown() ->
+    // read() does take ~30 seconds to figure out that a killed peer is
+    // never going to respond.  Therefore, it seems like doing the
+    // rshutdown() outside BUG_LOCK/UNLOCK could avoid holding that lock
+    // all that time.  Trying it now ...
 
     neDBG("peer_fd %3d: shutdown\n", handle->peer_fd);
     dbg = SHUTDOWN(handle->peer_fd, SHUT_RDWR);
@@ -404,144 +418,134 @@ int write_buffer(int fd, const char* buf, size_t size, int is_socket, off_t offs
 //     in the event of an undetected peer-failure, but allows
 //     non-disastrous read-performance, in the meantime.
 //
+// UPDATE: We switched to rpoll() because we were running out of fds (max
+//     size for FD_SET is 1024), and, anyhow, rpoll() should be more
+//     efficient.  Tests show that rpoll() works correctly in the places we
+//     were worried about for rselect(): (a) a message is sent before
+//     rpoll() is invoked by teh receiver, or (b) a message is sent when
+//     rpoll() is waiting for a timeout.
+//
 // TBD: As loads grow on the server, this might want to do something
-//     like write_buffer() does, to handle incomplete writes.
+//     like write_buffer() does, to handle incomplete writes.  [DONE.]
 
 int read_raw(int fd, char* buf, size_t size, int peek_p) {
    neDBG("read_raw(%d, 0x%llx, %lld, %d)\n", fd, buf, size, peek_p);
 
-   struct timeval tv;
-   int            rc;
+   int        rc = 0;
 
-   // WARNING: tried setting wait_usec small, to allow finer resolution.
-   //     However, that actually causes us to fail by radically
-   //     underestimating the elapsed time (such that RD_TIMEOUT indicates
-   //     30 seconds, and we're finishing the 300000 iterations that should
-   //     add up to 30 seconds in well under one second.  Larger
-   //     mait-period seems to work correctly.
-   const long M         = 1000000L;
-#if 0
-   // tested with SELECT
-   // const long wait_usec = 100;    /* 100 us.  too small: early rselect() timeout */
-   // const long wait_usec = M-1;    /* ~1 sec.  works, but too large? */
-   const long wait_usec = M/100;  /* 10 ms */
-#elif 1
-   // tested with POLL
-   // const long wait_usec = M;  /* 1 sec */
-   // const long wait_usec = M/100;  /* 10 ms */
-   const long wait_usec = M/1000;  /* 1 ms */
-#endif
+   const int  wait_millis_tot = (RD_TIMEOUT * 1000L);
+   int        period_millis   = (POLL_PERIOD * 1000L);
+   int        wait_millis     = period_millis;
+   if (unlikely(period_millis > wait_millis_tot))
+      wait_millis = wait_millis_tot;
 
-   const long i_max     = (M * RD_TIMEOUT) / wait_usec;
+   FastTimer  timer           = {0};
+   char*      buf1            = buf;
+   size_t     size1           = size;
 
-   int  i;
-   rc = 0;
-   for (i=0; (rc>=0 && i<i_max); ++i) {
+   fast_timer_start(&timer);
+
+   int       i;
+   for (i=0; i<MAX_RD_POLLS; ++i) {
 
       // --- wait for the fd to have data
-      //    (see comment about race-condition)
-#if 0
-      ssize_t read_count = RECV(fd, buf, size, (peek_p ? MSG_PEEK : MSG_WAITALL));
+      //     (see comment about race-condition)
+      //     Actually, we just get HUP, not RDHUP, if other end hung up
 
-#elif 0
-      if (i)
-         sched_yield();
+      int           interrupted = 0;
+      int           timed_out   = 0;
+      ssize_t       read_count  = 0;
+      struct pollfd pfd         = { .fd      = fd,
+                                    .events  = (POLLIN | POLLRDHUP),
+                                    //         implicit: POLLERR|POLLHUP|POLLNVAL
+                                    .revents = 0 };
 
-      // --- try the read
-      ssize_t read_count = RECV(fd, buf, size, (peek_p ? MSG_PEEK : MSG_DONTWAIT));
+      neDBG("entering RD poll with a timeout of %d [iter: %d]\n", wait_millis, i);
+      rc = POLL(&pfd, 1, wait_millis);
+      neDBG("poll returned %d (revents: 0x%02x) [iter: %d]\n", rc, pfd.revents, i);
 
-#elif 0
-      // SELECT
-
-      if ((unsigned)fd >= FD_SETSIZE) {
-         neERR("fd %u exceeds FD_SETSIZE\n", (unsigned) fd);
-         errno = EIO;
-         return -1;
-      }
-
-      fd_set rd_fds;
-      FD_ZERO(&rd_fds);
-      FD_SET(fd, &rd_fds);
-
-      // wait until <fd> has input (or timeout)
-      //      if (i) {
-         do {
-            tv.tv_sec  = 0;
-            tv.tv_usec = wait_usec;
-            rc = SELECT(fd +1, &rd_fds, NULL, NULL, &tv); // side-effect on <tv>
-         } while ((rc < 0) && (errno == EINTR));
-
-         if (rc < 0) {
-            neERR("select failed (iter: %d)\n", i);
+      if (rc < 0) {
+         if (errno == EINTR)
+            interrupted = 1;
+         else {
+            neERR("poll failed: %s [iter: %d]\n", strerror(errno), i);
             errno = EIO;
             return -1;
          }
-         //         neDBG("[%d] select returned %d (%s), with %ld.%06ld sec remaining\n",
-         //               i, rc, strerror(errno), tv.tv_sec, tv.tv_usec);
-      //      }
-
-
-      // --- try the read
-      ssize_t read_count = RECV(fd, buf, size, (peek_p ? MSG_PEEK : MSG_DONTWAIT));
-
-#elif 1
-      // POLL
-
-      int           wait_millis = (wait_usec / 1000) + 1;
-      struct pollfd pfd         = { .fd      = fd,
-                                    .events  = (POLLIN | POLLRDHUP),
-                                    .revents = 0 };
-      ssize_t       read_count;
-
-      rc = POLL(&pfd, 1, wait_millis);
-      //         neDBG("[%d] poll returned %d (%s)\n",
-      //               i, rc, strerror(errno));
-
-      if (rc < 0) {
-         neERR("poll failed (iter: %d)\n", i);
+      }
+      else if (rc == 0) {
+         timed_out = 1;
+      }
+      else if (! (pfd.revents & POLLIN)) { // see POLLOUT in write_raw()
+         neERR("poll got err-flags 0x%x [iter: %d]\n", pfd.revents, i);
          errno = EIO;
          return -1;
       }
-      else if (pfd.revents
-               && !(pfd.revents & POLLIN)) { // see POLLOUT in write_raw()
-         neERR("poll got err-flags 0x%x (iter: %d)\n", pfd.revents, i);
-         errno = EIO;
-         return -1;
+
+
+
+      if (! interrupted) {
+
+         // --- do the read
+         //     NOTE: HUP also shows POLLIN.  RECV() then returns 0.
+         neDBG("recv(%d, 0x%lx, %ld, 0x%02x) [iter: %d]\n",
+               fd, (size_t)buf1, size1, (peek_p ? MSG_PEEK : MSG_DONTWAIT), i);
+         read_count = RECV(fd, buf1, size1, (peek_p ? MSG_PEEK : MSG_DONTWAIT));
       }
-      else if (rc)
-         read_count = RECV(fd, buf, size, (peek_p ? MSG_PEEK : MSG_DONTWAIT));
-      else
-         continue;
 
-#else
-#     error "Forgot to pick an option"
-#endif
 
-      if (read_count == size) {
-         neDBG("read OK (iter: %d)\n", i);
+
+      // --- analyze read-results
+      if (unlikely(interrupted))
+         neDBG("interrupted.  Will try again [iter: %d]\n", i);
+
+      //      else if (unlikely(timed_out))
+      //         neDBG("period time-out.  Will try again [iter: %d]\n", i);
+
+      else if (likely(read_count == size1)) {
+         neDBG("read OK [iter: %d]\n", i);
          return 0;
       }
       else if (! read_count) {
-         neERR("read EOF (iter: %d)\n", i);
-         return -1;             // you called read_raw() expecting something
+         neERR("read EOF [iter: %d]\n", i);
+         return -1;
       }
       else if (read_count > 0) {
-         neERR("read %lld instead of %lld bytes (iter: %d)\n",
-               read_count, size, i);
-         return -1;
+         neERR("read %lld instead of %lld bytes [iter: %d]\n",
+               read_count, size1, i);
+
+         // got part of our expected read.  Iterate to get the rest.
+         buf1  += read_count;
+         size1 -= read_count;
       }
       else if ((errno != EAGAIN)
                && (errno != EWOULDBLOCK)) {
-         neERR("read failed (iter: %d)\n", i);
+         neERR("read failed [iter: %d]: %s\n", i, strerror(errno));
          return -1;
       }
+
+
+      // --- compute remaining timeout for retry
+      fast_timer_stop(&timer);
+      fast_timer_inits();       // first call computes ticks_per_sec
+
+      int remain_millis = wait_millis_tot - fast_timer_msec(&timer);
+      if (unlikely(remain_millis <= 0))
+         break;                 // timed out
+      else if (unlikely(remain_millis < period_millis))
+         wait_millis = remain_millis; // last ~period
+      else
+         wait_millis = period_millis;
+
+      neDBG("accumulated time = %d sec\n", fast_timer_sec(&timer));
+      fast_timer_start(&timer);
    }
 
    neERR("timeout after %d sec\n", RD_TIMEOUT);
    errno = EIO;
    return -1;
 }
-  
+
 
 // for small socket-writes that don't use RDMA
 //
@@ -551,141 +555,123 @@ int read_raw(int fd, char* buf, size_t size, int peek_p) {
 // had to iterate in write_raw().
 //
 // TBD: As loads grow on the server, this might want to do something
-//     like write_buffer() does.
+//     like write_buffer() does.  [DONE.]
+
 
 int write_raw(int fd, char* buf, size_t size) {
    neDBG("write_raw(%d, 0x%llx, %lld)\n", fd, buf, size);
 
-   struct timeval tv;
-   int            rc;
+   int        rc = 0;
 
-   // see corresponding notes in read_raw()
-   const long M         = 1000000L;
-#if 0
-   // tested with SELECT
-   // const long wait_usec = 100;    /* 100 us.  too small: causes early "timeout" */
-   // const long wait_usec = M-1;    /* ~1 sec.  works, but too large? */
-   const long wait_usec = M/100;  /* 10 ms */
-#elif 1
-   // tested with POLL
-   // const long wait_usec = M;  /* 1 sec */
-   // const long wait_usec = M/100;  /* 10 ms */
-   const long wait_usec = M/1000;  /* 1 ms */
-#endif
+   const int  wait_millis_tot = (WR_TIMEOUT * 1000L);
+   int        period_millis   = (POLL_PERIOD * 1000L);
+   int        wait_millis     = period_millis;
+   if (unlikely(period_millis > wait_millis_tot))
+      wait_millis = wait_millis_tot;
 
-   const long i_max     = (M * WR_TIMEOUT) / wait_usec;
+   FastTimer  timer           = {0};
+   char*      buf1            = buf;
+   size_t     size1           = size;
 
-   int  i;
-   rc = 0;
-   for (i=0; (rc>=0 && i<i_max); ++i) {
+   fast_timer_start(&timer);
 
-      // --- wait for the fd to have room
-      //    (see comment about race-condition)
-#if 0
-      ssize_t write_count = SEND(fd, buf, size, MSG_WAITALL);
+   int       i;
+   for (i=0; i<MAX_WR_POLLS; ++i) {
 
-#elif 0
-      if (i)
-         sched_yield();
+      // --- wait for the fd to have data
+      //     (see comment about race-condition)
 
-      // --- try the write
-      // ssize_t write_count = WRITE(fd, buf, size);
-      ssize_t write_count = SEND(fd, buf, size, MSG_DONTWAIT);
+      int           interrupted = 0;
+      int           timed_out   = 0;
+      ssize_t       write_count = 0;
+      struct pollfd pfd         = { .fd      = fd,
+                                    .events  = (POLLOUT),
+                                    //         implicit: POLLERR|POLLHUP|POLLNVAL
+                                    .revents = 0 };
 
-#elif 0
+      neDBG("entering WR poll with timeout %d ms [iter: %d]\n", wait_millis, i);
+      rc = POLL(&pfd, 1, wait_millis);
+      neDBG("poll returned %d (revents: 0x%02x) [iter: %d]\n", rc, pfd.revents, i);
 
-      if ((unsigned)fd >= FD_SETSIZE) {
-         neERR("fd %u exceeds FD_SETSIZE\n", (unsigned) fd);
-         errno = EIO;
-         return -1;
-      }
-
-      fd_set  wr_fds;
-      FD_ZERO(&wr_fds);
-      FD_SET(fd, &wr_fds);
-
-      // wait until <fd> has room for output (or timeout)
-      if (i) {
-         do {
-            tv.tv_sec  = 0;
-            tv.tv_usec = wait_usec;
-            rc = SELECT(fd +1, NULL, &wr_fds, NULL, &tv); // side-effect on <tv>
-         } while ((rc < 0) && (errno == EINTR));
-
-
-         if (rc < 0) {
-            neERR("select failed (iter: %d)\n", i);
+      if (rc < 0) {
+         if (errno == EINTR)
+            interrupted = 1;
+         else {
+            neERR("poll failed: %s [iter: %d]\n", strerror(errno), i);
             errno = EIO;
             return -1;
          }
-         //         neDBG("[%d] select returned %d (%s), with %ld.%06ld sec remaining\n",
-         //               i, rc, strerror(errno), tv.tv_sec, tv.tv_usec);
       }
-
-      // --- try the write
-      // ssize_t write_count = WRITE(fd, buf, size);
-      ssize_t write_count = SEND(fd, buf, size, MSG_DONTWAIT);
-
-#elif 1
-      // POLL
-
-      int           wait_millis = (wait_usec / 1000) + 1;
-      struct pollfd pfd         = { .fd      = fd,
-                                    .events  = (POLLOUT | POLLERR | POLLHUP | POLLNVAL),
-                                    .revents = 0 };
-      ssize_t       write_count;
-
-      rc = POLL(&pfd, 1, wait_millis);
-      //         neDBG("[%d] poll returned %d (%s)\n",
-      //               i, rc, strerror(errno));
-
-      if (rc < 0) {
-         neERR("poll failed (iter: %d)\n", i);
+      else if (rc == 0) {
+         timed_out = 1;
+      }
+      else if (! (pfd.revents & POLLOUT)) { // I saw POLLHUP + POLLOUT ?
+         neERR("poll got err-flags 0x%x [iter: %d]\n", pfd.revents, i);
          errno = EIO;
          return -1;
       }
-      else if (pfd.revents
-               && !(pfd.revents & (POLLOUT))) { // I saw POLLHUP + POLLOUT ?
-         neERR("poll got err-flags 0x%x (iter: %d)\n", pfd.revents, i);
-         errno = EIO;
-         return -1;
+
+
+      if (! interrupted) {
+
+         // --- do the write
+         neDBG("send(%d, 0x%lx, %ld, 0x%02x) [iter: %d]\n",
+               fd, (size_t)buf1, size1, MSG_DONTWAIT, i);
+         write_count = SEND(fd, buf1, size1, MSG_DONTWAIT);
       }
-      else if (rc)
-         // ssize_t write_count = WRITE(fd, buf, size);
-         write_count = SEND(fd, buf, size, MSG_DONTWAIT);
-      else
-         continue;
 
-#else
-#     error "Forgot to pick an option"
-#endif
 
-      if (write_count == size) {
-         neDBG("write OK (iter: %d)\n", i);
+      // --- analyze write-results
+      if (unlikely(interrupted))
+         neDBG("interrupted.  Will try again [iter: %d]\n", i);
+
+      //      else if (unlikely(timed_out))
+      //         neDBG("period time-out.  Will try again [iter: %d]\n", i);
+
+      else if (likely(write_count == size1)) {
+         neDBG("write OK [iter: %d]\n", i);
          return 0;
       }
       else if (! write_count) {
-         neERR("write EOF (iter: %d)\n", i);
-         return -1;
+         neERR("write EOF [iter: %d]\n", i);
+         return -1;             // you called read_raw() expecting something
       }
       else if (write_count > 0) {
-         neERR("write %lld instead of %lld bytes (iter: %d)\n",
-               write_count, size, i);
-         return -1;
+         neERR("wrote %lld instead of %lld bytes [iter: %d]\n",
+               write_count, size1, i);
+
+         // got part of our expected read.  Iterate to get the rest.
+         buf1  += write_count;
+         size1 -= write_count;
       }
       else if ((errno != EAGAIN)
                && (errno != EWOULDBLOCK)) {
-         neERR("write failed (iter: %d)\n", i);
+         neERR("write failed [iter: %d]: %s\n", i, strerror(errno));
          return -1;
       }
+
+
+      // --- compute remaining timeout for retry
+      fast_timer_stop(&timer);
+      fast_timer_inits();       // first call computes ticks_per_sec
+
+      neDBG("total wait, so far: %7.4f s [iter: %d]\n", fast_timer_msec(&timer), i);
+
+      int remain_millis = wait_millis_tot - fast_timer_msec(&timer);
+      if (unlikely(remain_millis <= 0))
+         break;                 // timed out
+      else if (unlikely(remain_millis < period_millis))
+         wait_millis = remain_millis; // last ~period
+      else
+         wait_millis = period_millis;
+
+      fast_timer_start(&timer);
    }
 
    neERR("timeout after %d sec\n", WR_TIMEOUT);
    errno = EIO;
    return -1;
 }
-
-
 
 
 

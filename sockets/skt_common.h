@@ -154,7 +154,7 @@ typedef void(*jHandlerType)(void* arg);
 #define SOCKET_NAME_PREFIX      "socket_"
 #define MAX_SOCKET_NAME_SIZE    (sizeof(SOCKET_NAME_PREFIX) + 10)
 
-#define MAX_SOCKET_CONNS        256  /* server-side */
+#define MAX_SOCKET_CONNS        512  /* server-side */
 
 #define FNAME_SIZE              512 /* incl final null */
 #define HOST_SIZE               128 /* incl final null */
@@ -195,20 +195,35 @@ typedef void(*jHandlerType)(void* arg);
 //     the server.
 
 #if DEBUG_SOCKETS
-// #  define WR_TIMEOUT          10000
-// #  define RD_TIMEOUT          10000
+#  define WR_TIMEOUT          10000
+#  define RD_TIMEOUT          10000
 
-// for debugging short-timeout probs, with logging enabled.
-#  define WR_TIMEOUT          30
-#  define RD_TIMEOUT          30
+// // for debugging short-timeout probs, with logging enabled.
+// #  define WR_TIMEOUT          30
+// #  define RD_TIMEOUT          30
 
 #else
 #  define WR_TIMEOUT             30
 #  define RD_TIMEOUT             30
-// #  define WR_TIMEOUT             10000
-// #  define RD_TIMEOUT             10000
 #endif
 
+
+// timeout period, per poll  (in sec)
+//
+// rpoll() doesn't detect peer-HUP after rpoll() has already begun waiting.
+// We must rpoll() again to see the HUP.  Having this shorter than
+// RD_/WR_TIMOUT allows server-side to reclaim dropped connections more
+// quickly.
+#define POLL_PERIOD           2
+
+// max number of failed polls and/or incomplete-reads/writes, in
+// read_raw()/write_raw().  Intended to detect a crazy number of interrupts
+// in a short time.  read/write_raw() will exit when this condition, or
+// RD/WR_TIMEOUT, is reached, whichever comes first.  When the timeouts are
+// long (i.e. when debugging), this should be long.
+// #define MAX_POLLS           500
+#define MAX_RD_POLLS           (RD_TIMEOUT * 20)
+#define MAX_WR_POLLS           (WR_TIMEOUT * 20)
 
 
 // max seconds server-side date string can lag behind date-string generated
@@ -451,7 +466,7 @@ typedef enum {
   CMD_RENAME,
   CMD_UNLINK,
 
-  CMD_TEST,
+  CMD_TEST,                     // iff built with --enable-test-api
 
   CMD_S3_AUTH,                  // client submits S3 signature, etc
   CMD_RIO_OFFSET,               // reader sends riomapped offset (for riowrite)
